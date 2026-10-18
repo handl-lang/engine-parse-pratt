@@ -1,4 +1,4 @@
-//! # handl-plugin-engine-parse-pratt
+//! # hnl-engine-parse-pratt
 //!
 //! The **Pratt engine** for the parse operation (ADR-0044 §3).
 //!
@@ -34,7 +34,7 @@ use handl_language::{
     Ast, AstNode, AstRef, AstShapeRef, ChildSeparator, DelimitedShape, GrammarPosition, LangError,
     Language, LiteralKind, Span, Token, Value,
 };
-use handl_plugin_engine_parse::{ParserEngine, ParserRequest};
+use hnl_engine_parse::{ParserEngine, ParserRequest};
 
 /// The Pratt parsing engine.
 ///
@@ -426,7 +426,7 @@ impl ParserEngine for PrattEngine {
 
     fn expression(
         &self,
-        ctx: &mut handl_plugin_engine_parse::ParserContext<'_, '_, Self>,
+        ctx: &mut hnl_engine_parse::ParserContext<'_, '_, Self>,
         rbp: u8,
     ) -> Result<AstRef, LangError> {
         // Build a cursor from the context's remaining tokens.
@@ -1599,7 +1599,7 @@ enum DelimitedResult {
 mod tests {
     use super::*;
     use handl_language::{AstShapeRef, GrammarPosition, GrammarRow, TokenKindDef, Tokens};
-    use handl_plugin_engine_parse::{ParserContext, ParserRequest};
+    use hnl_engine_parse::{ParserContext, ParserRequest};
     use serde_json::json;
 
     /// Build a small arithmetic language: numbers, `+` (infix, lbp 10),
@@ -1898,7 +1898,7 @@ mod tests {
     fn trait_expression_method_directly() {
         // Call the ParserEngine::expression trait method directly (not via
         // parse) to ensure the trait impl is covered.
-        use handl_plugin_engine_parse::ParserEngine as _;
+        use hnl_engine_parse::ParserEngine as _;
         let engine = PrattEngine::new();
         let lang = arith_lang();
         let tokens = vec![

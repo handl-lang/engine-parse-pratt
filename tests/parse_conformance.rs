@@ -4,7 +4,7 @@
 //! the `PrattEngine`, verifying it correctly reads `Language.grammar` data
 //! and produces the expected `Ast` for each case.
 
-use handl_plugin_engine_parse_pratt::PrattEngine;
+use hnl_engine_parse_pratt::PrattEngine;
 use handl_test_utils::conformance::run_parse_conformance;
 
 #[test]
