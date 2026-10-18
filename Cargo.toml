@@ -12,7 +12,7 @@ hnl-engine-parse = { git = "https://github.com/handl-lang/engine-parse", branch 
 serde_json = "1"
 
 [dev-dependencies]
-handl-test-utils = { git = "https://github.com/handl-lang/platform", branch = "main" }
+handl-test-utils = { git = "https://github.com/handl-lang/host", branch = "main" }
 serde_json = "1"
 
 [patch."https://github.com/handl-lang/engine"]
@@ -28,7 +28,7 @@ hnl-engine-parse = { path = "../engine-parse" }
 handl-language = { path = "../kernel/crates/handl-language" }
 handl-value = { path = "../kernel/crates/handl-value" }
 
-[patch."https://github.com/handl-lang/platform"]
-handl-platform = { path = "../platform/crates/platform" }
-handl-plugin-module = { path = "../platform/crates/plugin-module" }
-handl-test-utils = { path = "../platform/crates/handl-test-utils" }
+[patch."https://github.com/handl-lang/host"]
+handl-platform = { path = "../host/crates/platform" }
+handl-plugin-module = { path = "../host/crates/plugin-module" }
+handl-test-utils = { path = "../host/crates/handl-test-utils" }
