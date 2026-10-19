@@ -2193,7 +2193,7 @@ mod tests {
         let engine = PrattEngine::new();
         let mut lang = arith_lang();
         // Register the vau token kind and grammar row (mirrors the canonical
-        // `grammar.vau.prefix` row in handl-kit-data-canonical).
+        // `grammar.vau.prefix` row in handl-kit-data-prelude).
         lang.tokens.merge(TokenKindDef::new("token.vau")).unwrap();
         lang.grammar
             .merge(
@@ -3339,7 +3339,7 @@ mod tests {
     /// `(f<a>) >>> b` (composition *after* the dimension) is a flow whose
     /// left operand is a dimension — not a dimension itself. The inside-bracket
     /// counterpart `f<(a >>> b)>` is covered at kit level (real language) in
-    /// `crates/handl-kit-data-canonical/tests/graded_theory.rs`.
+    /// `crates/handl-kit-data-prelude/tests/graded_theory.rs`.
     #[test]
     fn paren_dimension_then_flow_is_not_a_dimension() {
         let engine = PrattEngine::new();
