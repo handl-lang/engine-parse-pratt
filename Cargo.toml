@@ -3,7 +3,7 @@ name = "hnl-engine-parse-pratt"
 version = "0.1.0"
 edition = "2024"
 description = "The **Pratt engine** for the parse operation (ADR-0044 §3)."
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/handl-lang/engine-parse-pratt"
 
 [dependencies]
