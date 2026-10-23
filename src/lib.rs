@@ -446,6 +446,129 @@ impl PrattEngine {
             .unwrap_or(false)
     }
 
+    /// Whether the `{` at the cursor opens a **record literal** rather
+    /// than a `block` — the `x ~> {k: v}` disambiguation (phase-3 WS-F).
+    ///
+    /// `block_children` claims every `{` for the block reading
+    /// (ADR-0074 ID.11's contextual `{}`), but a brace whose contents are
+    /// *entry-shaped* is a record. The scan is token-level and
+    /// conservative: the brace is a record iff it is non-empty and
+    /// **every** top-level element is entry-shaped — a single
+    /// expression-start token followed by the pair separator (`key :`
+    /// …) or the delimited shape's rest token (`...rest`). A
+    /// multi-statement block that merely *starts* with a type
+    /// annotation (`{x: Int\n y = f(x)\n y}`) is not all-entries — the
+    /// `y = …` element fails the shape test and the block reading is
+    /// kept; `x ~> {a: 1, b: 2}` and `x ~> {k: v}` resolve as records.
+    ///
+    /// `pair.separator` / `rest_token` / `close` all come from the `{`
+    /// prefix row's own delimited shape, so a language that spells
+    /// records differently still parses; a language with no `pair`
+    /// declared on its `{` row has no record syntax at all and every
+    /// brace stays a block.
+    fn brace_is_record(lang: &Language, cursor: &Cursor<'_>) -> bool {
+        let Some(lb_idx) = cursor.peek_index() else {
+            return false;
+        };
+        let lb_kind = Self::kind_for_label(lang, "{", "token.lbrace");
+        let Some(delim) = Self::lookup_row(lang, lb_kind, GrammarPosition::Prefix)
+            .and_then(|r| r.child_shape.delimited.as_ref())
+        else {
+            return false;
+        };
+        let Some(pair_sep) = delim.pair.as_ref().map(|p| p.separator.as_str()) else {
+            return false;
+        };
+        let close = delim.close.as_str();
+        let rest = delim.rest_token.as_deref();
+        let comma = Self::kind_for_label(lang, ",", "token.comma");
+        let semi = Self::kind_for_label(lang, ";", "token.semicolon");
+
+        // Per-element states: 0 = no token yet, 1 = saw key token,
+        // 2 = confirmed entry (`key :` or `...`), 3 = not entry-shaped.
+        let tokens = cursor.tokens;
+        let mut depth: i64 = 0;
+        let mut i = lb_idx + 1;
+        let mut completed = 0usize;
+        let mut state = 0u8;
+        let mut newline = false;
+        loop {
+            let Some(t) = tokens.get(i) else {
+                // Unclosed brace: not a record — the block reader owns
+                // the error path.
+                return false;
+            };
+            let k = t.kind.as_str();
+            if cursor.ignorable(k) {
+                // A line break at top level inside a non-empty element
+                // span ends the element (record literals are
+                // newline-separated like block statements).
+                if depth == 0
+                    && state != 0
+                    && (lang_token_flag(lang, k, |d| d.layout) || t.text.contains('\n'))
+                {
+                    newline = true;
+                }
+                i += 1;
+                continue;
+            }
+            if depth == 0 {
+                if k == close {
+                    break;
+                }
+                let explicit_sep = k == comma || k == semi;
+                if explicit_sep || (newline && state != 0) {
+                    // Element boundary: the element must have confirmed
+                    // entry shape (`,`/`;`/newline-separated entries),
+                    // and an empty element is not an entry.
+                    if state != 2 {
+                        return false;
+                    }
+                    completed += 1;
+                    state = 0;
+                    newline = false;
+                    if explicit_sep {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            // Element token accounting at top level only (a `:` nested
+            // inside a sub-expression's brackets does not make an
+            // entry).
+            if depth == 0 {
+                match state {
+                    0 => {
+                        state = if Some(k) == rest {
+                            2
+                        } else if Self::lookup_row(lang, k, GrammarPosition::Prefix).is_some() {
+                            1
+                        } else {
+                            3
+                        };
+                    }
+                    1 => state = if k == pair_sep { 2 } else { 3 },
+                    _ => {}
+                }
+            }
+            if Self::kind_in_category(lang, k, "open-bracket") {
+                depth += 1;
+            } else if Self::kind_in_category(lang, k, "close-bracket") {
+                if depth == 0 {
+                    // A mismatched closer (`)`/`]`) ends the scan — not
+                    // a record; the block reader owns the error.
+                    return false;
+                }
+                depth -= 1;
+            }
+            i += 1;
+        }
+        // At `}`: a pending element must be entry-shaped, an empty brace
+        // is not a record (the block reading keeps `{}` today), and at
+        // least one entry must exist.
+        (state == 0 && completed > 0) || state == 2
+    }
+
     /// Parse the index brace at the cursor into an `index_app` node:
     /// children are the target expression followed by one or more index
     /// arguments (`F{i, j, …}` / `name{b, …}` implicit binders).
@@ -1095,7 +1218,13 @@ impl PrattEngine {
                         .peek()
                         .map(|t| Self::kind_is_label(lang, &t.kind, "{", "token.lbrace"))
                         .unwrap_or(false)
+                    && !Self::brace_is_record(lang, cursor)
                 {
+                    // An entry-shaped `{` is a record literal, not a
+                    // block — `x ~> {k: v}` resolves like `x ~> ({k: v})`
+                    // (phase-3 WS-F; `brace_is_record` scans the brace
+                    // contents so a block whose first statement is a
+                    // type annotation keeps the block reading).
                     let block_open = Self::kind_for_label(lang, "{", "token.lbrace");
                     let block_delim = DelimitedShape {
                         open: block_open.into(),
@@ -2742,13 +2871,18 @@ mod tests {
                 .with_binding_power(12, 13),
             )
             .unwrap();
+        // `x ~> {…}`: the body is a contextual-`{}` block child — an
+        // entry-shaped brace parses as a record, anything else as a
+        // block (phase-3 WS-F `brace_is_record`).
+        let mut arrow_shape = AstShapeRef::new("function", 2);
+        arrow_shape.block_children = vec![1];
         lang.grammar
             .merge(
                 GrammarRow::new(
                     "g.arrow",
                     "token.arrow",
                     GrammarPosition::Infix,
-                    AstShapeRef::new("function", 2),
+                    arrow_shape,
                 )
                 .with_binding_power(31, 32),
             )
@@ -3119,6 +3253,128 @@ mod tests {
             ast.nodes()[children[1].as_u64().unwrap() as usize].payload,
             json!("A")
         );
+    }
+
+    // Phase-3 WS-F: `x ~> {…}` resolves an *entry-shaped* brace as a
+    // record literal (the `{` prefix row), everything else as a block —
+    // the parens `x ~> ({…})` are no longer required for records.
+
+    #[test]
+    fn arrow_body_entry_brace_parses_as_record() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // x ~> {a: 1}
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "x"),
+            tok("token.arrow", "~>"),
+            tok("token.lbrace", "{"),
+            tok("token.identifier", "a"),
+            tok("token.colon", ":"),
+            tok("token.number", "1"),
+            tok("token.rbrace", "}"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "function");
+        let children = root.payload["children"].as_array().unwrap();
+        let body = &ast.nodes()[children[1].as_u64().unwrap() as usize];
+        assert_eq!(body.kind, "object");
+        let entry = &ast.nodes()[body.payload["children"][0].as_u64().unwrap() as usize];
+        assert_eq!(entry.kind, "entry");
+    }
+
+    #[test]
+    fn arrow_body_multi_entry_brace_parses_as_record() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // x ~> {a: 1, "b": 2}
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "x"),
+            tok("token.arrow", "~>"),
+            tok("token.lbrace", "{"),
+            tok("token.identifier", "a"),
+            tok("token.colon", ":"),
+            tok("token.number", "1"),
+            tok("token.comma", ","),
+            tok("token.string", "\"b\""),
+            tok("token.colon", ":"),
+            tok("token.number", "2"),
+            tok("token.rbrace", "}"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        let body = &ast.nodes()[root.payload["children"][1].as_u64().unwrap() as usize];
+        assert_eq!(body.kind, "object");
+        assert_eq!(body.payload["children"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn arrow_body_mixed_brace_stays_block() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // x ~> {a: 1, b} — a bare (non-entry) element keeps the block
+        // reading: `{a: 1, b}` is a two-statement block, not a record
+        // with a positional element.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "x"),
+            tok("token.arrow", "~>"),
+            tok("token.lbrace", "{"),
+            tok("token.identifier", "a"),
+            tok("token.colon", ":"),
+            tok("token.number", "1"),
+            tok("token.comma", ","),
+            tok("token.identifier", "b"),
+            tok("token.rbrace", "}"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        let body = &ast.nodes()[root.payload["children"][1].as_u64().unwrap() as usize];
+        assert_eq!(body.kind, "block");
+    }
+
+    #[test]
+    fn arrow_body_empty_brace_stays_block() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // x ~> {} — the empty brace keeps its block reading.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "x"),
+            tok("token.arrow", "~>"),
+            tok("token.lbrace", "{"),
+            tok("token.rbrace", "}"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        let body = &ast.nodes()[root.payload["children"][1].as_u64().unwrap() as usize];
+        assert_eq!(body.kind, "block");
+        assert_eq!(body.payload["children"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn arrow_body_annot_then_expr_stays_block() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // x ~> {a: 1; a + b} — the second statement is not entry-shaped,
+        // so the brace keeps the block reading even though it starts
+        // with a `key :` statement (a type-annot in surface terms).
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "x"),
+            tok("token.arrow", "~>"),
+            tok("token.lbrace", "{"),
+            tok("token.identifier", "a"),
+            tok("token.colon", ":"),
+            tok("token.number", "1"),
+            tok("token.comma", ","), // `,` also separates block statements
+            tok("token.identifier", "a"),
+            tok("token.plus", "+"),
+            tok("token.identifier", "b"),
+            tok("token.rbrace", "}"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        let body = &ast.nodes()[root.payload["children"][1].as_u64().unwrap() as usize];
+        assert_eq!(body.kind, "block");
+        assert_eq!(body.payload["children"].as_array().unwrap().len(), 2);
     }
 
     #[test]
