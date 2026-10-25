@@ -215,10 +215,12 @@ impl PrattEngine {
     /// → `field-access`, e.g. `hash_map.get_or<...>`); the underscore variant
     /// is accepted for hand-built test languages.
     const DIMENSION_TARGET_KINDS: &'static [&'static str] =
-        &["var", "field-access", "field_access", "call", "dimension"];
+        &["var", "field-access", "field_access", "call", "dimension", "index_app"];
 
-    /// Whether the `<` at the cursor opens a **dimension bracket** rather
-    /// than a comparison (ADR-0106 §11).
+    /// Whether the `<` at the cursor opens a **dimension/index bracket**
+    /// rather than a comparison (ADR-0106 §11; index-position `<>` —
+    /// the former `{…}` index-application/index-binder surface — shares
+    /// this production: a dimension IS an index).
     ///
     /// `f<a>` and `f < a` are different productions, so the decision is
     /// deliberately conservative — all three must hold:
@@ -308,13 +310,22 @@ impl PrattEngine {
         false
     }
 
-    /// Parse the dimension bracket at the cursor into a `dimension` node
-    /// (ADR-0106 §11): children are the target expression followed by one or
-    /// more dimension arguments.
+    /// Parse the dimension/index bracket at the cursor into a `dimension`
+    /// node (ADR-0106 §11 + index-position `<>`): children are the target
+    /// expression followed by one or more bracket arguments.
     ///
     /// Arguments are parsed at a binding power above the comparison operators
     /// so the closing `>` is never consumed as `binary.gt`, and an empty
-    /// bracket (`f<>`) is rejected.
+    /// bracket (`f<>`) is rejected. Two index-application conveniences carry
+    /// over from the retired `{…}` surface:
+    ///
+    /// * whitespace application — while the next token starts an expression
+    ///   it folds into a `call` on the running head (`Vec<Succ n, a>` ⇒ arg 0
+    ///   is `call(Succ, n)`), since the language has no application infix;
+    /// * a sorted binder `n : Nat` — `:`'s infix binding power sits below the
+    ///   bracket's argument floor (above `>`), so a trailing `:` annotation is
+    ///   wrapped here into the same `type-annot` shape the `:` infix builds
+    ///   (`f<a, ev : Eq(a)>` keeps the evidence-binder form).
     fn parse_dimension(
         &self,
         lang: &Language,
@@ -324,9 +335,15 @@ impl PrattEngine {
         let lt = cursor.advance()?; // `<`
         let gt_kind = Self::kind_for_label(lang, ">", "token.gt");
         let comma_kind = Self::kind_for_label(lang, ",", "token.comma");
+        let colon_kind = Self::kind_for_label(lang, ":", "token.colon");
         let arg_rbp = Self::lookup_row(lang, gt_kind, GrammarPosition::Infix)
             .and_then(|r| r.binding_power.map(|(l, _)| l.saturating_add(1)))
             .unwrap_or(51);
+        // The `type-annot` node kind comes from the `:` infix row's own
+        // child shape — the sorted-binder wrap below mints the same layout
+        // the infix would (`[subject, annot]`).
+        let annot_kind = Self::lookup_row(lang, colon_kind, GrammarPosition::Infix)
+            .map(|r| r.child_shape.node_kind.clone());
         let mut children: Vec<usize> = vec![left.index()];
         loop {
             match cursor.peek().map(|t| t.kind.as_str()) {
@@ -350,8 +367,53 @@ impl PrattEngine {
                 }
                 _ => {}
             }
-            let arg = self.expression_inner(lang, cursor, arg_rbp)?;
-            children.push(arg.index());
+            // One argument: an expression, then whitespace-application —
+            // while the next token starts an expression, fold it into a
+            // `call` on the running head (`Succ n` ⇒ `call(Succ, n)`).
+            let mut head = self.expression_inner(lang, cursor, arg_rbp)?;
+            let mut args: Vec<usize> = Vec::new();
+            while Self::can_start_expression(lang, cursor) {
+                args.push(self.expression_inner(lang, cursor, arg_rbp)?.index());
+            }
+            if !args.is_empty() {
+                let mut kids: Vec<usize> = vec![head.index()];
+                kids.extend(args);
+                head = self.push_spanned(
+                    "call",
+                    Value::Object(
+                        [(
+                            "children".to_string(),
+                            Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    Self::span_union(self.child_span(head), cursor.last_span()),
+                );
+            }
+            // Sorted binder `n : Nat` — the `:` infix binds below the
+            // argument floor, so the annotation is wrapped explicitly and
+            // the `type-annot` kind is read from the `:` row's own shape.
+            if let (Some(ak), Some(t)) = (&annot_kind, cursor.peek()) {
+                if t.kind.as_str() == colon_kind {
+                    cursor.advance()?; // `:`
+                    let annot = self.expression_inner(lang, cursor, arg_rbp)?;
+                    let kids = vec![head.index(), annot.index()];
+                    head = self.push_spanned(
+                        ak.as_str(),
+                        Value::Object(
+                            [(
+                                "children".to_string(),
+                                Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        ),
+                        Self::span_union(self.child_span(head), cursor.last_span()),
+                    );
+                }
+            }
+            children.push(head.index());
             match cursor.peek().map(|t| t.kind.as_str()) {
                 Some(k) if k == comma_kind => {
                     cursor.advance()?;
@@ -380,65 +442,9 @@ impl PrattEngine {
         Ok(self.push_spanned("dimension", Value::Object(payload_fields), span))
     }
 
-    /// Node kinds that may take an adjacent index brace `f{...}` (phase-2
-    /// WS-C sugar): identifier and name-like call/field forms — the same
-    /// convention `dimension` uses for `f<...>`.
-    const INDEX_APP_TARGET_KINDS: &'static [&'static str] =
-        &["var", "field-access", "field_access", "call", "dimension", "index_app"];
-
-    /// Whether the `{` at the cursor opens an **index-application brace**
-    /// `F{i, …}` rather than a block/object literal.
-    ///
-    /// `{` is the block/delimited/object opener, so — exactly like
-    /// `dimension`'s `<` — this only fires on the unambiguous spelling:
-    ///
-    /// 1. the brace is written **adjacent** to the previous token
-    ///    (`Vec{n, a}` / `head{n, a}`, never `match v { … }` /
-    ///    `if c { … }`) — whitespace before `{` keeps its block reading;
-    /// 2. the left operand is a name-like target
-    ///    ([`Self::INDEX_APP_TARGET_KINDS`]).
-    ///
-    /// Anything else falls through to the `object` prefix rule (or ends
-    /// the expression — a bare `{` has no infix row).
-    fn index_app_applies(&self, _lang: &Language, cursor: &Cursor<'_>, left: AstRef) -> bool {
-        let lb = match cursor.peek() {
-            Some(t) => t,
-            None => return false,
-        };
-        // (1) adjacency: no whitespace between the previous non-ignorable
-        // token and `{`. `v {` / `c {` are blocks, never index braces.
-        let lb_idx = cursor.peek_index();
-        let adjacent = lb_idx
-            .and_then(|i| {
-                let mut j = i;
-                while j > 0 {
-                    j -= 1;
-                    let prev = &cursor.tokens[j];
-                    if !cursor.ignorable(&prev.kind) {
-                        // `lb.start > 0` excludes span-less synthetic
-                        // tokens (tests/hand-built streams carry 0
-                        // positions — there is no adjacency evidence
-                        // either way, so the block reading wins).
-                        return Some(prev.end == lb.start && lb.start > 0);
-                    }
-                }
-                None
-            })
-            .unwrap_or(false);
-        if !adjacent {
-            return false;
-        }
-        // (2) name-like target.
-        let kind = {
-            let ast = self.ast.borrow();
-            ast.get(left).map(|n| n.kind.clone())
-        };
-        matches!(kind.as_deref(), Some(k) if Self::INDEX_APP_TARGET_KINDS.contains(&k))
-    }
-
     /// Whether the token at the cursor can *start* an expression (has a
     /// declared prefix grammar row) — used for whitespace application
-    /// inside index braces (`Vec{Succ n, a}` ⇒ `call(Succ, n)`).
+    /// inside index brackets (`Vec<Succ n, a>` ⇒ `call(Succ, n)`).
     fn can_start_expression(lang: &Language, cursor: &Cursor<'_>) -> bool {
         cursor
             .peek()
@@ -569,95 +575,6 @@ impl PrattEngine {
         (state == 0 && completed > 0) || state == 2
     }
 
-    /// Parse the index brace at the cursor into an `index_app` node:
-    /// children are the target expression followed by one or more index
-    /// arguments (`F{i, j, …}` / `name{b, …}` implicit binders).
-    ///
-    /// Arguments are comma-separated expressions parsed at full binding
-    /// power; **whitespace inside the braces is application** — each
-    /// argument greedily absorbs following expression-start tokens into a
-    /// `call` node (`Vec{Succ n, a}` ⇒ arg 0 is `call(Succ, n)`), since
-    /// index-argument position is where constructor terms live.
-    fn parse_index_app(
-        &self,
-        lang: &Language,
-        cursor: &mut Cursor<'_>,
-        left: AstRef,
-    ) -> Result<AstRef, LangError> {
-        let lb = cursor.advance()?; // `{`
-        let rb_kind = Self::closing_kind(lang, &lb.kind, "token.rbrace");
-        let comma_kind = Self::kind_for_label(lang, ",", "token.comma");
-        let mut children: Vec<usize> = vec![left.index()];
-        // Empty brace `f{}` is rejected (there is no nullary index app).
-        if cursor.peek().map(|t| t.kind.as_str() == rb_kind).unwrap_or(false) {
-            return Err(LangError::engine_at(
-                "index application: empty brace (`f{}`) — expected at least one argument".to_string(),
-                cursor.current_span().or(lb.span()),
-                Some("token".to_string()),
-            ));
-        }
-        loop {
-            // One argument: an expression, then whitespace-application —
-            // while the next token starts an expression, fold it into a
-            // `call` on the running head (`Succ n` ⇒ `call(Succ, n)`).
-            let mut head = self.expression_inner(lang, cursor, 0)?;
-            let mut args: Vec<usize> = Vec::new();
-            while Self::can_start_expression(lang, cursor) {
-                args.push(self.expression_inner(lang, cursor, 0)?.index());
-            }
-            if !args.is_empty() {
-                let mut kids: Vec<usize> = vec![head.index()];
-                kids.extend(args);
-                head = self.push_spanned(
-                    "call",
-                    Value::Object(
-                        [(
-                            "children".to_string(),
-                            Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
-                        )]
-                        .into_iter()
-                        .collect(),
-                    ),
-                    Self::span_union(self.child_span(head), cursor.last_span()),
-                );
-            }
-            children.push(head.index());
-            match cursor.peek().map(|t| t.kind.as_str()) {
-                Some(k) if k == comma_kind => {
-                    cursor.advance()?;
-                    // Tolerate a trailing comma before the close.
-                    if cursor.peek().map(|t| t.kind.as_str() == rb_kind).unwrap_or(false) {
-                        break;
-                    }
-                    continue;
-                }
-                Some(k) if k == rb_kind => break,
-                None => {
-                    return Err(LangError::engine_at(
-                        "index application: unclosed brace — expected `,` or `}`".to_string(),
-                        cursor.last_span(),
-                        Some("token".to_string()),
-                    ));
-                }
-                Some(k) => {
-                    return Err(LangError::engine_at(
-                        format!("index application: expected `,` or `}}`, got {k}"),
-                        cursor.current_span(),
-                        Some("token".to_string()),
-                    ));
-                }
-            }
-        }
-        let _rb = cursor.advance()?; // `}`
-        let mut payload_fields: serde_json::Map<String, Value> = serde_json::Map::new();
-        payload_fields.insert(
-            "children".to_string(),
-            Value::Array(children.iter().map(|i| Value::from(*i)).collect()),
-        );
-        let start = self.child_span(left);
-        let span = Self::span_union(start, cursor.last_span());
-        Ok(self.push_spanned("index_app", Value::Object(payload_fields), span))
-    }
 }
 
 impl Default for PrattEngine {
@@ -1042,7 +959,9 @@ impl PrattEngine {
         // 3. Infix (left-denotation) loop.
         let mut left = left;
         while let Some(next) = cursor.peek() {
-            // Dimension specialization `f<...>` (ADR-0106 §11) is a special
+            // Dimension/index bracket `f<…>` (ADR-0106 §11 + index-position
+            // `<>` — the former `{…}` index-application/index-binder surface
+            // shares this production: a dimension IS an index) is a special
             // production, not a declarative row: check it before the infix
             // row lookup so it does not depend on a `<` grammar row, and
             // before the binding-power gate so the bracket binds tighter
@@ -1057,19 +976,6 @@ impl PrattEngine {
                 && self.dimension_applies(lang, cursor, left)
             {
                 left = self.parse_dimension(lang, cursor, left)?;
-                continue;
-            }
-
-            // Index-application brace `f{…}` (phase-2 WS-C sugar) — the
-            // `{`-collides-with-block counterpart of the dimension bracket:
-            // a special production checked before the infix row lookup
-            // (`token.lbrace` has no infix row and must keep not having
-            // one). It fires only on the adjacent spelling (`Vec{n, a}`),
-            // never on a spaced block opener (`match v { … }`).
-            if Self::kind_is_label(lang, &next.kind, "{", "token.lbrace")
-                && self.index_app_applies(lang, cursor, left)
-            {
-                left = self.parse_index_app(lang, cursor, left)?;
                 continue;
             }
 
