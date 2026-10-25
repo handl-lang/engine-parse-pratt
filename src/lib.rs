@@ -575,6 +575,185 @@ impl PrattEngine {
         (state == 0 && completed > 0) || state == 2
     }
 
+    // -----------------------------------------------------------------------
+    // ADR-0158 — the one-declaration family surface
+    // -----------------------------------------------------------------------
+
+    /// Rewrite a root-level record-literal family declaration
+    /// `F := { C : F, C′ : (args…) ~> R, … }` into the internal `data` node
+    /// (ADR-0158).
+    ///
+    /// The record spelling is the *surface*; `data` remains the node the rest
+    /// of the pipeline reads (`type.data` → `synth_data` in the checker,
+    /// `data` → `desugar_data` in the desugar pass). Lowering here — right
+    /// after the arena is built — keeps both consumers unchanged, so a family
+    /// declared in either spelling yields one identical arena.
+    ///
+    /// Field reading (ADR-0158 §"Field reading"):
+    ///
+    /// - `C : F` — nullary constructor, no result annotation (the exact
+    ///   `data F :: C` shape, so an indexed family keeps its `bare`
+    ///   base-index convention);
+    /// - `C : F(i⃗)` — nullary constructor whose result index vector is `i⃗`;
+    /// - `C : (x : T, …) ~> R` — constructor with an argument telescope and
+    ///   result index vector `R`.
+    ///
+    /// The rewrite is deliberately narrow: it fires only on the arena's
+    /// **root** (the last node — the one-declaration-per-`parse` chunk every
+    /// consumer reads its root from) and only when every field's codomain head
+    /// names the declared family, so a record of types (`P := { x : Num }`)
+    /// or any other binding keeps parsing as a binding.
+    ///
+    /// Arena-order invariant: the Pratt arena is insertion-ordered (children
+    /// before parents) and the desugar pass walks it bottom-up, while the root
+    /// is "the last node". The emitted constructors reuse the already parsed
+    /// field nodes as children, the **first** emitted node takes over the
+    /// declaration's own slot (nothing is orphaned, and that slot's children
+    /// all precede it), and the `data` node is pushed last — keeping both
+    /// conventions intact.
+    fn canonicalize_family_records(&self, lang: &Language) {
+        // The internal node kind stays `data` (`ast.yaml` `ast.data`,
+        // `types.yaml` `type.data`): a language that declares no such shape
+        // gets no family-record lowering.
+        let Some(shape) = lang.ast.get_by_identity(DATA_NODE_KIND) else {
+            return;
+        };
+        let data_kind = shape.node_kind.clone();
+        // Lower **every** family-record declaration in the arena, not only the
+        // chunk root: a module parses several statements into one arena, so a
+        // declaration is usually an inner node. Root-ness decides which slot
+        // the `data` node lands in (see the closure below).
+        let plans = {
+            let ast = self.ast.borrow();
+            let root = ast.len().checked_sub(1);
+            (0..ast.len())
+                .filter_map(|idx| {
+                    family_record_plan(lang, &ast, idx).map(|plan| (plan, Some(idx) == root))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (plan, is_root) in plans {
+            self.lower_family_record(&data_kind, &plan, is_root);
+        }
+    }
+
+    /// Apply one [`FamilyRecordPlan`].
+    ///
+    /// `as_root` reproduces the single-declaration chunk: the `data` node is
+    /// pushed last so it stays the arena root (consumers read the root from
+    /// the last index). Otherwise the declaration is an inner statement, its
+    /// index is already referenced by the enclosing block, so the `data` node
+    /// is written **in place** and the block's child list stays valid.
+    fn lower_family_record(
+        &self,
+        data_kind: &str,
+        plan: &FamilyRecordPlan,
+        as_root: bool,
+    ) {
+        let mut slot = if as_root { Some(plan.node_idx) } else { None };
+        let mut ctors: Vec<usize> = Vec::with_capacity(plan.ctors.len());
+        for ctor in &plan.ctors {
+            // Leaf: a fresh `call` for an argumented ctor, a fresh
+            // `type-annot` for an indexed nullary ctor, or the field key node
+            // itself for a bare nullary ctor.
+            let leaf = if !ctor.args.is_empty() {
+                let mut kids = vec![ctor.key];
+                kids.extend(ctor.args.iter().copied());
+                let span = self.span_over(&kids);
+                self.emit(&mut slot, "call", children_payload(&kids), span)
+            } else if let Some(result) = ctor.result {
+                let payload = type_annot_payload(ctor.key, result, None);
+                let span = self.span_over(&[ctor.key, result]);
+                self.emit(&mut slot, "type-annot", payload, span)
+            } else {
+                ctor.key
+            };
+            // `Bare` constructors stay unwrapped — `data F :: C` emits no
+            // result annotation for them, and the checker's bare-constructor
+            // index convention (`0` for the first `Nat` index) hangs off
+            // exactly that absence.
+            match ctor.result {
+                None => ctors.push(leaf),
+                Some(result) => {
+                    let payload = type_annot_payload(leaf, result, Some(&ctor.name));
+                    let span = self.span_over(&[ctor.key, result]);
+                    let wrapped = self.emit(&mut slot, "type-annot", payload, span);
+                    ctors.push(wrapped);
+                }
+            }
+        }
+        // A lone bare constructor emits nothing, so the declaration's slot is
+        // still open: fill it with the constructor's own name node — the same
+        // `var` leaf `data F :: C` produces.
+        if let Some(open) = slot.take() {
+            let payload = Value::from(plan.ctors[0].name.clone());
+            self.fill_slot(open, "var", payload, plan.span);
+            ctors[0] = open;
+        }
+        // `A | B | C` — the left-nested binary `alt` chain the `|` infix
+        // builds, so the ctor list has one shape in both spellings.
+        let mut acc = ctors[0];
+        for &next in &ctors[1..] {
+            let span = self.span_over(&[acc, next]);
+            acc = self
+                .push_spanned("alt", children_payload(&[acc, next]), span)
+                .index();
+        }
+        // The `data` node itself.
+        let mut payload = children_payload(&[plan.head_idx, acc]);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("name".to_string(), Value::from(plan.family.clone()));
+        }
+        if as_root {
+            // Push last so it stays the arena root.
+            self.push_spanned(data_kind, payload, plan.span);
+        } else {
+            // Inner statement: take over the declaration's own slot.
+            self.fill_slot(plan.node_idx, data_kind, payload, plan.span);
+        }
+    }
+
+    /// Emit a node for the ADR-0158 lowering: the **first** emission takes
+    /// over the declaration's own slot (so no orphaned binding node survives
+    /// in the arena), later ones are appended last-in-first-out — every
+    /// emitted node's children are already in the arena.
+    fn emit(
+        &self,
+        slot: &mut Option<usize>,
+        kind: &str,
+        payload: Value,
+        span: Option<Span>,
+    ) -> usize {
+        match slot.take() {
+            Some(open) => {
+                self.fill_slot(open, kind, payload, span);
+                open
+            }
+            None => self.push_spanned(kind, payload, span).index(),
+        }
+    }
+
+    /// Overwrite the node at `slot`.
+    fn fill_slot(&self, slot: usize, kind: &str, payload: Value, span: Option<Span>) {
+        let mut node = AstNode::new(kind).with_payload(payload);
+        if let Some(s) = span {
+            node = node.with_span(s);
+        }
+        if let Some(cell) = self.ast.borrow_mut().get_mut(AstRef::new(slot)) {
+            *cell = node;
+        }
+    }
+
+    /// The smallest span covering the nodes at `idxs`.
+    fn span_over(&self, idxs: &[usize]) -> Option<Span> {
+        let mut acc: Option<Span> = None;
+        for i in idxs {
+            acc = Self::span_union(acc, self.child_span(AstRef::new(*i)));
+        }
+        acc
+    }
+
 }
 
 impl Default for PrattEngine {
@@ -615,6 +794,14 @@ impl ParserEngine for PrattEngine {
             lang,
         };
         let _root = self.expression_inner(lang, &mut cursor, 0)?;
+
+        // ADR-0158: the one-declaration family surface. A root-level
+        // `F := { C : F, C : (args…) ~> R }` record literal is lowered into
+        // the internal `data` node the checker (`type.data` →
+        // `synth_data`) and the desugar native (`data` → `desugar_data`)
+        // already read, so the record spelling and the retired
+        // `data F :: …` spelling produce one identical node.
+        self.canonicalize_family_records(lang);
 
         // Return the built arena. Root = last node pushed.
         Ok(self.ast.borrow().clone())
@@ -1797,6 +1984,291 @@ enum DelimitedResult {
     Container(usize),
     /// Elements to splice directly into the parent's children (flatten: true).
     Elements(Vec<usize>),
+}
+
+/// The AST kind of an inductive-family declaration (`ast.yaml` `ast.data`,
+/// `types.yaml` `type.data`). ADR-0158 removed the `data` *keyword*; the node
+/// kind stays as the single internal shape both spellings lower to.
+const DATA_NODE_KIND: &str = "data";
+
+/// A resolved record-literal family declaration (ADR-0158) — what the
+/// `assign` node at `node_idx` is to be rewritten into.
+struct FamilyRecordPlan {
+    /// The `assign` node carrying the declaration.
+    node_idx: usize,
+    /// The declared family name (`Nat`, `Vec`).
+    family: String,
+    /// The family head type expression — the `assign`'s target node
+    /// (`Nat` / `Vec<n : Nat, a : Type>`), which already has the
+    /// `var` / `call` / `dimension` shape the checker and desugar read.
+    head_idx: usize,
+    /// The constructors, in declaration order.
+    ctors: Vec<FamilyCtorPlan>,
+    /// Source span of the whole declaration.
+    span: Option<Span>,
+}
+
+/// One record field read as a constructor (ADR-0158 §"Field reading"), in the
+/// three shapes the `data` consumers recognise:
+///
+/// | field            | node               | `result` | `args` |
+/// |------------------|--------------------|----------|--------|
+/// | `C : F`          | bare `var C`       | `None`   | —      |
+/// | `C : F(i⃗)`       | `type-annot(C, R)` | `Some`   | —      |
+/// | `C : (a⃗) ~> R`   | `call` + `type-annot` | `Some` | `a⃗`   |
+struct FamilyCtorPlan {
+    /// The constructor name (the record field key).
+    name: String,
+    /// The field key node — reused as the constructor's name leaf / callee.
+    key: usize,
+    /// The declared result type expression (`F` is spelled bare, so `None`).
+    result: Option<usize>,
+    /// The argument telescope nodes (the `(…)` element children), if any.
+    args: Vec<usize>,
+}
+
+/// The `children` index array of a node's payload (empty when absent).
+fn node_children(node: &AstNode) -> Vec<usize> {
+    node.payload
+        .get("children")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The name a **name-atom** node carries. A name atom is a leaf whose payload
+/// IS the datum (the `var` convention); a computed or compound node has none.
+fn node_name(node: &AstNode) -> Option<&str> {
+    if node.payload.get("children").is_some() {
+        return None;
+    }
+    node.payload.as_str()
+}
+
+/// The `children` slot of a declared child role, positional fallback — the
+/// grammar rows build `[target, value]` / `[key, value]` / `[params, body]`
+/// positionally, so a role-less shape lands on the same slot.
+fn child_slot(lang: &Language, node: &AstNode, role: &str, fallback: usize) -> usize {
+    lang.child_role_index_for(node, role)
+        .ok()
+        .flatten()
+        .unwrap_or(fallback)
+}
+
+/// The child index stored in `slot` of `node`, if any.
+fn child_index(node: &AstNode, slot: usize) -> Option<usize> {
+    node_children(node).get(slot).copied()
+}
+
+/// Whether `node` is a binding (declaration) node — a shape declaring the
+/// `binding` face (ADR-0123), else the canonical `assign`.
+fn is_binding_node(lang: &Language, node: &AstNode) -> bool {
+    if lang.shape_has_face(&node.kind, "binding") {
+        return true;
+    }
+    !lang.declares_faces(&node.kind) && node.kind == "assign"
+}
+
+/// Whether `node` is an arrow/lambda form (`A ~> B`) — the `lambda` face,
+/// else the canonical `function`.
+fn is_lambda_node(lang: &Language, node: &AstNode) -> bool {
+    if lang.shape_has_face(&node.kind, "lambda") {
+        return true;
+    }
+    !lang.declares_faces(&node.kind) && node.kind == "function"
+}
+
+/// Whether `node` is a record literal container (`{ … }`) — the declared
+/// `entries` pattern role, else the canonical `object`.
+fn is_record_node(lang: &Language, node: &AstNode) -> bool {
+    match lang.pattern_role_is(&node.kind, "entries") {
+        Some(is) => is,
+        None => node.kind == "object",
+    }
+}
+
+/// Whether `node` is one record field — the declared `entry` pattern role,
+/// else the canonical `entry`.
+fn is_entry_node(lang: &Language, node: &AstNode) -> bool {
+    match lang.pattern_role_is(&node.kind, "entry") {
+        Some(is) => is,
+        None => node.kind == "entry",
+    }
+}
+
+/// The family name a type expression applies: the name a bare atom carries
+/// (`F`), or the head of an application form (`F(…)` / `F<…>` / `F[…]`),
+/// resolved through the declared `callee`/`target` child role.
+fn head_name(lang: &Language, ast: &Ast, node: &AstNode) -> Option<String> {
+    if let Some(name) = node_name(node) {
+        return Some(name.to_string());
+    }
+    let role = if lang.child_role_index_for(node, "callee").ok().flatten().is_some() {
+        "callee"
+    } else {
+        "target"
+    };
+    let kid = child_index(node, child_slot(lang, node, role, 0))?;
+    node_name(ast.get(AstRef::new(kid))?).map(str::to_string)
+}
+
+/// Read the `assign` node at `idx` as a family declaration (ADR-0158), or
+/// `None` when it is any other binding.
+///
+/// The declaration is recognised structurally — never by name — and must read
+/// cleanly in full: a binding whose target names a family and whose value is a
+/// record literal every field of which declares a constructor of that family.
+/// A binding that fails any test stays a plain binding.
+fn family_record_plan(lang: &Language, ast: &Ast, idx: usize) -> Option<FamilyRecordPlan> {
+    let node = ast.get(AstRef::new(idx))?;
+    if !is_binding_node(lang, node) {
+        return None;
+    }
+    // Exactly `target` + `value`: the three-child `let`-form binding
+    // (`x = v in body`) is never a declaration.
+    let target_idx = child_index(node, child_slot(lang, node, "target", 0))?;
+    let value_idx = child_index(node, child_slot(lang, node, "value", 1))?;
+    let target = ast.get(AstRef::new(target_idx))?;
+    let value = ast.get(AstRef::new(value_idx))?;
+    if !is_record_node(lang, value) {
+        return None;
+    }
+    let family = head_name(lang, ast, target)?;
+
+    let mut ctors = Vec::new();
+    for field_idx in node_children(value) {
+        let field = ast.get(AstRef::new(field_idx))?;
+        if !is_entry_node(lang, field) {
+            return None;
+        }
+        let key_idx = child_index(field, child_slot(lang, field, "key", 0))?;
+        let field_value_idx = child_index(field, child_slot(lang, field, "value", 1))?;
+        // A computed key (`[expr]: …`) is not a constructor name.
+        let name = node_name(ast.get(AstRef::new(key_idx))?)?.to_string();
+        ctors.push(family_ctor_plan(
+            lang,
+            ast,
+            name,
+            key_idx,
+            field_value_idx,
+            &family,
+        )?);
+    }
+    if ctors.is_empty() {
+        return None;
+    }
+    Some(FamilyRecordPlan {
+        node_idx: idx,
+        family,
+        head_idx: target_idx,
+        ctors,
+        span: {
+            let a = ast.get(AstRef::new(target_idx)).and_then(|n| n.span);
+            let b = ast.get(AstRef::new(value_idx)).and_then(|n| n.span);
+            match (a, b) {
+                (Some(a), Some(b)) => Some(Span {
+                    start: a.start.min(b.start),
+                    end: a.end.max(b.end),
+                }),
+                (a, b) => a.or(b),
+            }
+        },
+    })
+}
+
+/// Read one record field as a constructor of `family` (ADR-0158).
+///
+/// - `C : F` → bare nullary constructor;
+/// - `C : F(i⃗)` → nullary constructor with a result index vector;
+/// - `C : (a⃗) ~> R` → constructor with an argument telescope.
+///
+/// Anything whose codomain head is not the declared family is not a
+/// constructor, so the enclosing declaration is left alone.
+fn family_ctor_plan(
+    lang: &Language,
+    ast: &Ast,
+    name: String,
+    key: usize,
+    field_value: usize,
+    family: &str,
+) -> Option<FamilyCtorPlan> {
+    let field = ast.get(AstRef::new(field_value))?;
+    let bare = FamilyCtorPlan {
+        name,
+        key,
+        result: None,
+        args: Vec::new(),
+    };
+    if !is_lambda_node(lang, field) {
+        if head_name(lang, ast, field)? != family {
+            return None;
+        }
+        // A bare name atom IS the family (`C : F`); an application
+        // (`C : F(i⃗)`) declares the result indices.
+        return Some(if node_name(field).is_some() {
+            bare
+        } else {
+            FamilyCtorPlan {
+                result: Some(field_value),
+                ..bare
+            }
+        });
+    }
+    // `(a⃗) ~> R` — the arrow's param child must be the parenthesised
+    // telescope (a variadic collection node), and the codomain head must name
+    // the family.
+    let params = ast.get(AstRef::new(child_index(
+        field,
+        child_slot(lang, field, "params", 0),
+    )?))?;
+    if !lang.has_variadic_role(&params.kind) {
+        return None;
+    }
+    let body = ast.get(AstRef::new(child_index(
+        field,
+        child_slot(lang, field, "body", 1),
+    )?))?;
+    if head_name(lang, ast, body)? != family {
+        return None;
+    }
+    let args = node_children(params);
+    if args.is_empty() {
+        return None;
+    }
+    Some(FamilyCtorPlan {
+        result: Some(child_index(field, child_slot(lang, field, "body", 1))?),
+        args,
+        ..bare
+    })
+}
+
+
+fn children_payload(kids: &[usize]) -> Value {
+    Value::Object(
+        [(
+            "children".to_string(),
+            Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
+        )]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// The payload of a `type-annot` node: the parser's shape — the
+/// `[subject, annot]` children plus the subject's name under `name`
+/// (`grammar.type-annot.infix` `payload_extract`).
+fn type_annot_payload(subject: usize, annot: usize, name: Option<&str>) -> Value {
+    let mut payload = children_payload(&[subject, annot]);
+    if let Some(name) = name {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("name".to_string(), Value::from(name));
+        }
+    }
+    payload
 }
 
 #[cfg(test)]
