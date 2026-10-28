@@ -651,7 +651,10 @@ impl PrattEngine {
         plan: &FamilyRecordPlan,
         as_root: bool,
     ) {
-        let mut slot = if as_root { Some(plan.node_idx) } else { None };
+        // Constructors always get fresh nodes: writing one into the
+        // declaration slot makes the `data` node its own descendant, which the
+        // positivity walk follows forever.
+        let mut slot: Option<usize> = None;
         let mut ctors: Vec<usize> = Vec::with_capacity(plan.ctors.len());
         for ctor in &plan.ctors {
             // Leaf: a fresh `call` for an argumented ctor, a fresh
