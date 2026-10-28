@@ -214,8 +214,14 @@ impl PrattEngine {
     /// `field-access` is the canonical spelling (`grammar.field-access.postfix`
     /// → `field-access`, e.g. `hash_map.get_or<...>`); the underscore variant
     /// is accepted for hand-built test languages.
-    const DIMENSION_TARGET_KINDS: &'static [&'static str] =
-        &["var", "field-access", "field_access", "call", "dimension", "index_app"];
+    const DIMENSION_TARGET_KINDS: &'static [&'static str] = &[
+        "var",
+        "field-access",
+        "field_access",
+        "call",
+        "dimension",
+        "index_app",
+    ];
 
     /// Whether the `<` at the cursor opens a **dimension/index bracket**
     /// rather than a comparison (ADR-0106 §11; index-position `<>` —
@@ -394,24 +400,24 @@ impl PrattEngine {
             // Sorted binder `n : Nat` — the `:` infix binds below the
             // argument floor, so the annotation is wrapped explicitly and
             // the `type-annot` kind is read from the `:` row's own shape.
-            if let (Some(ak), Some(t)) = (&annot_kind, cursor.peek()) {
-                if t.kind.as_str() == colon_kind {
-                    cursor.advance()?; // `:`
-                    let annot = self.expression_inner(lang, cursor, arg_rbp)?;
-                    let kids = vec![head.index(), annot.index()];
-                    head = self.push_spanned(
-                        ak.as_str(),
-                        Value::Object(
-                            [(
-                                "children".to_string(),
-                                Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
-                            )]
-                            .into_iter()
-                            .collect(),
-                        ),
-                        Self::span_union(self.child_span(head), cursor.last_span()),
-                    );
-                }
+            if let (Some(ak), Some(t)) = (&annot_kind, cursor.peek())
+                && t.kind.as_str() == colon_kind
+            {
+                cursor.advance()?; // `:`
+                let annot = self.expression_inner(lang, cursor, arg_rbp)?;
+                let kids = [head.index(), annot.index()];
+                head = self.push_spanned(
+                    ak.as_str(),
+                    Value::Object(
+                        [(
+                            "children".to_string(),
+                            Value::Array(kids.iter().map(|i| Value::from(*i)).collect()),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    Self::span_union(self.child_span(head), cursor.last_span()),
+                );
             }
             children.push(head.index());
             match cursor.peek().map(|t| t.kind.as_str()) {
@@ -645,12 +651,7 @@ impl PrattEngine {
     /// the last index). Otherwise the declaration is an inner statement, its
     /// index is already referenced by the enclosing block, so the `data` node
     /// is written **in place** and the block's child list stays valid.
-    fn lower_family_record(
-        &self,
-        data_kind: &str,
-        plan: &FamilyRecordPlan,
-        as_root: bool,
-    ) {
+    fn lower_family_record(&self, data_kind: &str, plan: &FamilyRecordPlan, as_root: bool) {
         // Constructors always get fresh nodes: writing one into the
         // declaration slot makes the `data` node its own descendant, which the
         // positivity walk follows forever.
@@ -756,7 +757,6 @@ impl PrattEngine {
         }
         acc
     }
-
 }
 
 impl Default for PrattEngine {
@@ -1273,7 +1273,7 @@ impl PrattEngine {
                 }
                 let right = self.expression_inner(lang, cursor, rbp_right)?;
                 let mut payload_fields: serde_json::Map<String, Value> = serde_json::Map::new();
-                let children = vec![left.index(), grade.index(), right.index()];
+                let children = [left.index(), grade.index(), right.index()];
                 payload_fields.insert(
                     "children".to_string(),
                     Value::Array(children.iter().map(|i| Value::from(*i)).collect()),
@@ -1732,10 +1732,10 @@ impl PrattEngine {
                 }
             }
             ChildSeparator::Optional(kind) => {
-                if let Some(t) = cursor.peek() {
-                    if t.kind == *kind {
-                        let _ = cursor.advance()?;
-                    }
+                if let Some(t) = cursor.peek()
+                    && t.kind == *kind
+                {
+                    let _ = cursor.advance()?;
                 }
             }
             ChildSeparator::OneOf(kinds) => {
@@ -1823,23 +1823,23 @@ impl PrattEngine {
         let mut elements: Vec<usize> = Vec::new();
 
         // Empty block: `open close` (or just `close` when open_is_operator).
-        if let Some(next) = cursor.peek() {
-            if next.kind == delim.close {
-                let close = cursor.advance()?;
-                let span = Self::span_union(start, close.span());
-                return if delim.flatten {
-                    Ok(DelimitedResult::Elements(elements))
-                } else {
-                    let idx = self
-                        .push_spanned(
-                            delim.container_kind.as_str(),
-                            serde_json::json!({ "children": elements }),
-                            span,
-                        )
-                        .index();
-                    Ok(DelimitedResult::Container(idx))
-                };
-            }
+        if let Some(next) = cursor.peek()
+            && next.kind == delim.close
+        {
+            let close = cursor.advance()?;
+            let span = Self::span_union(start, close.span());
+            return if delim.flatten {
+                Ok(DelimitedResult::Elements(elements))
+            } else {
+                let idx = self
+                    .push_spanned(
+                        delim.container_kind.as_str(),
+                        serde_json::json!({ "children": elements }),
+                        span,
+                    )
+                    .index();
+                Ok(DelimitedResult::Container(idx))
+            };
         }
 
         loop {
@@ -1891,10 +1891,10 @@ impl PrattEngine {
                 Some(t) if delim.separator.as_deref() == Some(t.kind.as_str()) => {
                     let _ = cursor.advance()?; // consume separator
                     // Tolerate a trailing separator immediately before close.
-                    if let Some(t2) = cursor.peek() {
-                        if t2.kind == delim.close {
-                            break;
-                        }
+                    if let Some(t2) = cursor.peek()
+                        && t2.kind == delim.close
+                    {
+                        break;
                     }
                     continue;
                 }
@@ -1919,10 +1919,10 @@ impl PrattEngine {
                         .unwrap_or(false)
                     {
                         let _ = cursor.advance()?;
-                        if let Some(t2) = cursor.peek() {
-                            if t2.kind == delim.close {
-                                break;
-                            }
+                        if let Some(t2) = cursor.peek()
+                            && t2.kind == delim.close
+                        {
+                            break;
                         }
                     }
                     continue;
@@ -2110,7 +2110,12 @@ fn head_name(lang: &Language, ast: &Ast, node: &AstNode) -> Option<String> {
     if let Some(name) = node_name(node) {
         return Some(name.to_string());
     }
-    let role = if lang.child_role_index_for(node, "callee").ok().flatten().is_some() {
+    let role = if lang
+        .child_role_index_for(node, "callee")
+        .ok()
+        .flatten()
+        .is_some()
+    {
         "callee"
     } else {
         "target"
@@ -2249,7 +2254,6 @@ fn family_ctor_plan(
     })
 }
 
-
 fn children_payload(kids: &[usize]) -> Value {
     Value::Object(
         [(
@@ -2266,10 +2270,10 @@ fn children_payload(kids: &[usize]) -> Value {
 /// (`grammar.type-annot.infix` `payload_extract`).
 fn type_annot_payload(subject: usize, annot: usize, name: Option<&str>) -> Value {
     let mut payload = children_payload(&[subject, annot]);
-    if let Some(name) = name {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("name".to_string(), Value::from(name));
-        }
+    if let Some(name) = name
+        && let Some(obj) = payload.as_object_mut()
+    {
+        obj.insert("name".to_string(), Value::from(name));
     }
     payload
 }
@@ -2537,9 +2541,9 @@ mod tests {
     fn atom_float_payload_for_float_number() {
         let engine = PrattEngine::new();
         let lang = arith_lang();
-        let req = ParserRequest::new(Tokens(vec![tok("token.number", "3.14")]));
+        let req = ParserRequest::new(Tokens(vec![tok("token.number", "3.25")]));
         let ast = engine.parse(&lang, &req).unwrap();
-        assert_eq!(ast.nodes()[0].payload, json!(3.14));
+        assert_eq!(ast.nodes()[0].payload, json!(3.25));
     }
 
     #[test]
@@ -4013,7 +4017,6 @@ mod tests {
             text: text.into(),
             start,
             end,
-            ..Default::default()
         }
     }
     // --- Dimension specialization `f<...>` (ADR-0106 §11) --------------------
