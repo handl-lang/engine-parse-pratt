@@ -796,7 +796,64 @@ impl ParserEngine for PrattEngine {
             pos: 0,
             lang,
         };
-        let _root = self.expression_inner(lang, &mut cursor, 0)?;
+        let first = self.expression_inner(lang, &mut cursor, 0)?;
+
+        // Top-level sequencing. A program is the same element list a
+        // separator-free `do { … }` block parses (`parse_delimited_block`
+        // with `separator: None`): each element is one expression at rbp
+        // 0, and `,`/`;` are tolerated between elements. Parsing only the
+        // first expression and dropping the rest silently truncated every
+        // multi-statement program — `1 + 1\n2 + 2` evaluated as `2`, and a
+        // leading `from "…" import …` (which evaluates to `null`) hid the
+        // entire body behind it. Collect every top-level expression; when
+        // there is more than one, wrap them in the `block` node `do { … }`
+        // produces so `eval_block` runs them in order and the last value
+        // wins — the same semantics `hnl run`'s `do { … }` source wrap
+        // already gives callers.
+        let mut statements = vec![first.index()];
+        loop {
+            // Inter-statement separators — the same `,`/`;` tolerance
+            // `parse_delimited_block` applies to separator-free blocks,
+            // resolved by surface label so a differently-spelled language
+            // still parses.
+            let comma_kind = Self::kind_for_label(lang, ",", "token.comma");
+            let semi_kind = Self::kind_for_label(lang, ";", "token.semicolon");
+            while cursor
+                .peek()
+                .map(|t| t.kind == comma_kind || t.kind == semi_kind)
+                .unwrap_or(false)
+            {
+                cursor.advance()?;
+            }
+            if !Self::can_start_expression(lang, &cursor) {
+                break;
+            }
+            let stmt = self.expression_inner(lang, &mut cursor, 0)?;
+            statements.push(stmt.index());
+        }
+
+        // Anything left in the stream is a genuine parse error — it used
+        // to be lexed (so lex errors still fired) but never parsed, so
+        // trailing garbage like `1 + 1\n)` "parsed" as `1 + 1`.
+        if let Some(t) = cursor.peek() {
+            return Err(LangError::engine_at(
+                format!(
+                    "unexpected token after top-level expression: {} (wrap multiple statements in `{{ … }}` or separate them)",
+                    t.kind
+                ),
+                t.span(),
+                Some("token".to_string()),
+            ));
+        }
+
+        if statements.len() > 1 {
+            // The sequence container is the same `block` node kind the
+            // `do { … }` prefix emits (the engine already spells it in the
+            // synthetic `DelimitedShape`s above). Pushed last so it stays
+            // the arena root; its children are already in the arena.
+            let span = self.span_over(&statements);
+            self.push_spanned("block", serde_json::json!({ "children": statements }), span);
+        }
 
         // ADR-0158: the one-declaration family surface. A root-level
         // `F := { C : F, C : (args…) ~> R }` record literal is lowered into
@@ -2492,6 +2549,81 @@ mod tests {
     }
 
     #[test]
+    fn multiple_top_level_expressions_wrap_in_block() {
+        let engine = PrattEngine::new();
+        let lang = arith_lang();
+        // `1 + 2` then `3 + 4` — two top-level statements. The arena is the
+        // same shape `do { 1 + 2\n3 + 4 }` produces: a `block` root whose
+        // children are the two `binary.add` nodes, so `eval_block` runs
+        // them in order and the last value wins.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.number", "1"),
+            tok("token.plus", "+"),
+            tok("token.number", "2"),
+            tok("token.number", "3"),
+            tok("token.plus", "+"),
+            tok("token.number", "4"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.len(), 7);
+        // Nodes 0-2: lit(1), lit(2), add([0,1]); nodes 3-5: lit(3), lit(4),
+        // add([3,4]); node 6: block(children=[2,5]) — the arena root.
+        assert_eq!(ast.nodes()[2].kind, "binary.add");
+        assert_eq!(ast.nodes()[5].kind, "binary.add");
+        assert_eq!(ast.nodes()[6].kind, "block");
+        assert_eq!(ast.nodes()[6].payload, json!({"children": [2, 5]}));
+    }
+
+    #[test]
+    fn top_level_semicolon_and_comma_separate_statements() {
+        let engine = PrattEngine::new();
+        let lang = arith_lang();
+        // `1 + 2 ; 3 + 4` — the separator-free block tolerance applies at
+        // the top level too.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.number", "1"),
+            tok("token.plus", "+"),
+            tok("token.number", "2"),
+            tok("token.semicolon", ";"),
+            tok("token.number", "3"),
+            tok("token.plus", "+"),
+            tok("token.number", "4"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.nodes().last().unwrap().kind, "block");
+        // A trailing separator before EOF is tolerated, like a trailing
+        // separator before a block's close.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.number", "1"),
+            tok("token.plus", "+"),
+            tok("token.number", "2"),
+            tok("token.comma", ","),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.len(), 3);
+        assert_eq!(ast.nodes()[2].kind, "binary.add");
+    }
+
+    #[test]
+    fn trailing_garbage_after_expression_is_a_parse_error() {
+        let engine = PrattEngine::new();
+        let lang = arith_lang();
+        // `1 + 2` then `)` — `)` cannot start an expression, so it is a
+        // genuine trailing token: previously it was lexed but silently
+        // dropped and the parse "succeeded" as `1 + 2`.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.number", "1"),
+            tok("token.plus", "+"),
+            tok("token.number", "2"),
+            tok("token.rparen", ")"),
+        ]));
+        let err = engine.parse(&lang, &req).unwrap_err();
+        assert!(matches!(err, LangError::Engine { .. }));
+        let msg = format!("{}", err);
+        assert!(msg.contains("unexpected token after top-level expression"));
+    }
+
+    #[test]
     fn infix_without_binding_power_errors() {
         let engine = PrattEngine::new();
         let mut lang = arith_lang();
@@ -2742,12 +2874,17 @@ mod tests {
             ))
             .unwrap();
         // Tokens: number(1) x — after parsing number(1), the next token
-        // is "x" which has no infix rule, so parsing stops.
+        // is "x" which has no infix rule, so the infix loop stops. At the
+        // top level `x` then parses as a *second* statement (it has a
+        // prefix rule), so the arena root is a `block` over both.
         let req = ParserRequest::new(Tokens(vec![tok("token.number", "1"), tok("token.x", "x")]));
         let ast = engine.parse(&lang, &req).unwrap();
-        // Only the number atom is parsed; "x" is left unconsumed.
-        assert_eq!(ast.len(), 1);
+        // lit(1), x, block(children=[0,1]) — the block is the root.
+        assert_eq!(ast.len(), 3);
         assert_eq!(ast.nodes()[0].kind, "lit");
+        assert_eq!(ast.nodes()[1].kind, "x");
+        assert_eq!(ast.nodes()[2].kind, "block");
+        assert_eq!(ast.nodes()[2].payload, json!({"children": [0, 1]}));
     }
 
     #[test]
@@ -2852,7 +2989,8 @@ mod tests {
     #[test]
     fn optional_child_does_not_swallow_following_expression() {
         // `if 1 2 3` — the `3` is not an `else` token, so the `if` node is
-        // arity 2 and `3` is left unconsumed (next statement).
+        // arity 2 and `3` parses as the *next* top-level statement: the
+        // arena root is a `block` over [if, lit(3)].
         let engine = PrattEngine::new();
         let lang = optional_else_lang();
         let req = ParserRequest::new(Tokens(vec![
@@ -2862,9 +3000,13 @@ mod tests {
             tok("token.number", "3"),
         ]));
         let ast = engine.parse(&lang, &req).unwrap();
+        // Nodes 0-1: lit(1), lit(2); node 2: if(children=[0,1]); node 3:
+        // lit(3); node 4: block(children=[2,3]).
+        assert_eq!(ast.nodes()[2].kind, "if");
+        assert_eq!(ast.nodes()[2].payload, json!({"children": [0, 1]}));
         let root = ast.nodes().last().unwrap();
-        assert_eq!(root.kind, "if");
-        assert_eq!(root.payload, json!({"children": [0, 1]}));
+        assert_eq!(root.kind, "block");
+        assert_eq!(root.payload, json!({"children": [2, 3]}));
     }
 
     #[test]
