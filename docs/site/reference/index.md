@@ -6,13 +6,13 @@
 |---|---|
 | `GrammarRow` input | prefix/infix descriptors keyed by token and position |
 | `Ast` output | arena of nodes; the **root node is the last node** of the arena |
-| `ParserEngine` impl | the `engine-parse` contract |
+| `ParserEngine` impl | the `tool-parse` contract |
 
 ## Crate
 
 | crate | role |
 |---|---|
-| `hnl-engine-parse-pratt` | engine implementation |
+| `hnl-tool-parse-pratt` | engine implementation |
 
 ## Build and test
 

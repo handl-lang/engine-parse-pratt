@@ -5,7 +5,7 @@
 //! and produces the expected `Ast` for each case.
 
 use handl_test_utils::conformance::run_parse_conformance;
-use hnl_engine_parse_pratt::PrattEngine;
+use hnl_tool_parse_pratt::PrattEngine;
 
 #[test]
 fn pratt_engine_passes_parse_conformance() {

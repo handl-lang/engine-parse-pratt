@@ -1,4 +1,4 @@
-# engine-parse-pratt
+# tool-parse-pratt
 
 The Pratt parser: top-down operator precedence driven by grammar data.
 
@@ -11,9 +11,9 @@ child shape are read from the descriptor and executed (ADR-0044 §3).
 
 ## Start here
 
-- **Reference** — [public API](/engine-parse-pratt/reference/)
-- **How-to** — [task recipes](/engine-parse-pratt/how-to/)
-- **Explanation** — [design and rationale](/engine-parse-pratt/explanation/)
+- **Reference** — [public API](/tool-parse-pratt/reference/)
+- **How-to** — [task recipes](/tool-parse-pratt/how-to/)
+- **Explanation** — [design and rationale](/tool-parse-pratt/explanation/)
 
 No tutorials: this repo is a building block used from Rust. End-to-end
 walkthroughs live with the product that composes it — see the

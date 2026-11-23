@@ -6,14 +6,14 @@
 //! the same shape a source-level `VNil : Vec(0, a)` annotation parses to.
 //! A double wrap (`type-annot(type-annot(C, R), R, name)`) leaves the
 //! `subject` a `type-annot`, which leaf-peeling consumers
-//! (`engine-transform-rewrite`'s `collect_constructor_leaf`,
-//! `engine-typecheck-nbe`'s `collect_ctors`) silently drop — indexed
+//! (`tool-transform-rewrite`'s `collect_constructor_leaf`,
+//! `tool-typecheck-nbe`'s `collect_ctors`) silently drop — indexed
 //! nullary ctors vanished from the desugared family.
 
 use handl_kit_data_prelude::language_from_yaml;
-use hnl_engine_lex_pattern::lex;
-use hnl_engine_parse::{ParserEngine, ParserRequest};
-use hnl_engine_parse_pratt::PrattEngine;
+use hnl_tool_lex_pattern::lex;
+use hnl_tool_parse::{ParserEngine, ParserRequest};
+use hnl_tool_parse_pratt::PrattEngine;
 use handl_language::{Ast, AstNode, AstRef};
 
 fn parse_family(src: &str) -> Ast {

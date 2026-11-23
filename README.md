@@ -1,6 +1,6 @@
-# engine-parse-pratt
+# tool-parse-pratt
 
-`hnl-engine-parse-pratt` — the Pratt engine for the parse operation.
+`hnl-tool-parse-pratt` — the Pratt engine for the parse operation.
 
 An `engine-*` crate: a concrete parser engine driven by precedence/associativity
 data from the `Language`, not by per-kind `match` arms.
@@ -21,4 +21,4 @@ MIT.
 
 ## Documentation
 
-<https://handl-lang.github.io/docs/engine-parse-pratt/>
+<https://handl-lang.github.io/docs/tool-parse-pratt/>

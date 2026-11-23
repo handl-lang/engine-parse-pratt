@@ -12,5 +12,5 @@ This crate belongs to the `engine-*` family. Plugins, kits and hosts reach it
 through the kit's operation slot, so the engine can be swapped without touching a
 language definition.
 
-See the [reference](/engine-parse-pratt/reference/) for the API and the
-[how-to guides](/engine-parse-pratt/how-to/) for tasks.
+See the [reference](/tool-parse-pratt/reference/) for the API and the
+[how-to guides](/tool-parse-pratt/how-to/) for tasks.
