@@ -2,7 +2,7 @@
 
 `hnl-tool-parse-pratt` — the Pratt engine for the parse operation.
 
-An `engine-*` crate: a concrete parser engine driven by precedence/associativity
+A `tool-*` crate: a concrete parser engine driven by precedence/associativity
 data from the `Language`, not by per-kind `match` arms.
 
 ## Development
