@@ -629,18 +629,42 @@ impl PrattEngine {
         // chunk root: a module parses several statements into one arena, so a
         // declaration is usually an inner node. Root-ness decides which slot
         // the `data` node lands in (see the closure below).
-        let plans = {
+        let (plans, orig_len) = {
             let ast = self.ast.borrow();
             let root = ast.len().checked_sub(1);
-            (0..ast.len())
-                .filter_map(|idx| {
-                    family_record_plan(lang, &ast, idx).map(|plan| (plan, Some(idx) == root))
-                })
-                .collect::<Vec<_>>()
+            let orig_len = ast.len();
+            (
+                (0..ast.len())
+                    .filter_map(|idx| {
+                        family_record_plan(lang, &ast, idx).map(|plan| (plan, Some(idx) == root))
+                    })
+                    .collect::<Vec<_>>(),
+                orig_len,
+            )
         };
 
+        // An `as_root` plan always sorts last (its `node_idx` is the arena's
+        // last index), so its `data` node — pushed last — stays the root
+        // even when inner plans ran before it. Inner plans only append
+        // constructor/`alt` nodes *after* the semantic root, so without a
+        // root plan the arena's last node is a constructor-list `alt`,
+        // not the enclosing `block`: consumers read the root from the last
+        // index (`apply_desugar`, the checker's module walk), so the root
+        // node is re-emitted last to restore the convention.
+        let mut saw_root_plan = false;
         for (plan, is_root) in plans {
+            saw_root_plan |= is_root;
             self.lower_family_record(&data_kind, &plan, is_root);
+        }
+        if !saw_root_plan && self.ast.borrow().len() > orig_len && orig_len > 0 {
+            let root_node = self
+                .ast
+                .borrow()
+                .get(AstRef::new(orig_len - 1))
+                .cloned();
+            if let Some(node) = root_node {
+                self.ast.borrow_mut().push(node);
+            }
         }
     }
 
@@ -658,18 +682,18 @@ impl PrattEngine {
         let mut slot: Option<usize> = None;
         let mut ctors: Vec<usize> = Vec::with_capacity(plan.ctors.len());
         for ctor in &plan.ctors {
-            // Leaf: a fresh `call` for an argumented ctor, a fresh
-            // `type-annot` for an indexed nullary ctor, or the field key node
-            // itself for a bare nullary ctor.
+            // Leaf: a fresh `call` for an argumented ctor, or the field key
+            // node itself otherwise. An indexed nullary ctor (`C : F(i⃗)`)
+            // wraps exactly once below — `type-annot(C, R, name)` — matching
+            // the single wrap a source-level `C : R` annotation parses to;
+            // a second wrap would leave the `subject` a `type-annot`, which
+            // leaf-peeling consumers (`desugar`'s `collect_constructor_leaf`,
+            // the checker's ctor walks) silently drop.
             let leaf = if !ctor.args.is_empty() {
                 let mut kids = vec![ctor.key];
                 kids.extend(ctor.args.iter().copied());
                 let span = self.span_over(&kids);
                 self.emit(&mut slot, "call", children_payload(&kids), span)
-            } else if let Some(result) = ctor.result {
-                let payload = type_annot_payload(ctor.key, result, None);
-                let span = self.span_over(&[ctor.key, result]);
-                self.emit(&mut slot, "type-annot", payload, span)
             } else {
                 ctor.key
             };
