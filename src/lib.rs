@@ -1524,6 +1524,11 @@ impl PrattEngine {
                     })
                 })
                 .unwrap_or(false);
+            // `same_line` steps match only when the token is adjacent to
+            // the last consumed one — a line break ends the tail (the
+            // `GrammarRow::same_line` counterpart for `import <name>
+            // from "<path>"`-style suffixes).
+            let matches = matches && !(step.same_line && cursor.layout_ahead());
             if !matches {
                 prev_matched = false;
                 if step.optional {
@@ -1545,7 +1550,8 @@ impl PrattEngine {
                     // The matched token is not the opener; treat the step as
                     // a plain token capture.
                     if let Some(field) = &step.field {
-                        payload_fields.insert(field.clone(), Value::from(tok.text.as_str()));
+                        payload_fields
+                            .insert(field.clone(), self.atom_payload(lang, &tok));
                     }
                     continue;
                 }
@@ -1648,7 +1654,12 @@ impl PrattEngine {
                     payload_fields.insert(field.clone(), Value::Array(collected));
                 }
             } else if let Some(field) = &step.field {
-                payload_fields.insert(field.clone(), Value::from(tok.text.as_str()));
+                // Store the token's interpreted literal value (unquoted
+                // string contents, numbers, …) — the same payload shape
+                // `payload_extract` produces for the `from`-form's path,
+                // so `payload.path` means the same thing on both import
+                // spellings. `LiteralKind::Raw` kinds store their text.
+                payload_fields.insert(field.clone(), self.atom_payload(lang, &tok));
             }
         }
         Ok(())
@@ -2338,7 +2349,9 @@ fn type_annot_payload(subject: usize, annot: usize, name: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
-    use handl_language::{AstShapeRef, GrammarPosition, GrammarRow, TokenKindDef, Tokens};
+    use handl_language::{
+        AstShapeRef, GrammarPosition, GrammarRow, TokenKindDef, TokenStep, Tokens,
+    };
     use hnl_engine_parse::{ParserContext, ParserRequest};
     use serde_json::json;
 
@@ -2621,6 +2634,166 @@ mod tests {
         assert!(matches!(err, LangError::Engine { .. }));
         let msg = format!("{}", err);
         assert!(msg.contains("unexpected token after top-level expression"));
+    }
+
+    /// A mini language exercising `AstShapeRef::trailing_tokens` with the
+    /// `same_line` gate — the `import <name> [from "<path>"]` surface:
+    /// `import` takes one child (a `var`) plus an optional same-line
+    /// `from "<path>"` tail captured into `payload.path`; `from` also has
+    /// a bare prefix row so a newline-separated `from <expr>` still
+    /// parses as its own statement.
+    fn import_tail_lang() -> Language {
+        let mut lang = Language::new();
+        let mut newline = TokenKindDef::new("token.newline");
+        newline.layout = true;
+        lang.tokens.merge(newline).unwrap();
+        lang.tokens.merge(TokenKindDef::new("token.import")).unwrap();
+        lang.tokens.merge(TokenKindDef::new("token.from")).unwrap();
+        lang.tokens.merge(TokenKindDef::new("token.ident")).unwrap();
+        lang.tokens
+            .merge(
+                TokenKindDef::new("token.string").with_literal(LiteralKind::String {
+                    delim_chars: 1,
+                    escapes: Vec::new(),
+                }),
+            )
+            .unwrap();
+
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "g.var",
+                    "token.ident",
+                    GrammarPosition::Prefix,
+                    AstShapeRef::new("var", 0),
+                )
+                .with_binding_power(0, 0),
+            )
+            .unwrap();
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "g.string",
+                    "token.string",
+                    GrammarPosition::Prefix,
+                    AstShapeRef::new("value", 0),
+                )
+                .with_binding_power(0, 0),
+            )
+            .unwrap();
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "g.from",
+                    "token.from",
+                    GrammarPosition::Prefix,
+                    AstShapeRef::new("stmt.from", 1),
+                )
+                .with_binding_power(0, 0),
+            )
+            .unwrap();
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "g.import",
+                    "token.import",
+                    GrammarPosition::Prefix,
+                    AstShapeRef::new("stmt.import", 1).with_trailing_tokens(vec![
+                        TokenStep {
+                            kinds: vec!["token.from".to_string()],
+                            field: None,
+                            optional: true,
+                            requires_prev_match: false,
+                            same_line: true,
+                            delimited: None,
+                        },
+                        TokenStep {
+                            kinds: vec!["token.string".to_string()],
+                            field: Some("path".to_string()),
+                            optional: false,
+                            requires_prev_match: true,
+                            same_line: false,
+                            delimited: None,
+                        },
+                    ]),
+                )
+                .with_binding_power(0, 0),
+            )
+            .unwrap();
+        lang
+    }
+
+    #[test]
+    fn import_from_tail_captures_path_payload() {
+        let engine = PrattEngine::new();
+        let lang = import_tail_lang();
+        // `import id from "data/atoms"` — the `from "<path>"` tail is
+        // consumed into `payload.path` (unquoted, like the `from`-form's
+        // `payload_extract`), leaving a single `stmt.import` node.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.import", "import"),
+            tok("token.ident", "id"),
+            tok("token.from", "from"),
+            tok("token.string", "\"data/atoms\""),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        // Trailing tokens are payload captures, not child nodes: the
+        // arena holds only var(id) and stmt.import.
+        assert_eq!(ast.len(), 2);
+        let import = &ast.nodes()[1];
+        assert_eq!(import.kind, "stmt.import");
+        assert_eq!(import.payload["path"], json!("data/atoms"));
+        assert_eq!(import.payload["children"], json!([0]));
+    }
+
+    #[test]
+    fn import_from_tail_is_same_line_gated() {
+        let engine = PrattEngine::new();
+        let lang = import_tail_lang();
+        // `import id` NEWLINE `from "m"` — the `from` opens a new
+        // statement rather than being absorbed into the import's tail:
+        // two top-level expressions wrap in a `block`, and the import
+        // carries no `path`.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.import", "import"),
+            tok("token.ident", "id"),
+            tok("token.newline", "\n"),
+            tok("token.from", "from"),
+            tok("token.string", "\"m\""),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        // Arena order: var(id)=0, stmt.import=1, value("m")=2,
+        // stmt.from=3, block=4 — the block is the arena root.
+        let import = ast
+            .nodes()
+            .iter()
+            .find(|n| n.kind == "stmt.import")
+            .expect("stmt.import node");
+        assert!(import.payload.get("path").is_none());
+        let from = ast
+            .nodes()
+            .iter()
+            .find(|n| n.kind == "stmt.from")
+            .expect("stmt.from node");
+        assert_eq!(from.payload["children"], json!([2]));
+        assert_eq!(ast.nodes().last().unwrap().kind, "block");
+    }
+
+    #[test]
+    fn import_without_from_tail_still_parses() {
+        let engine = PrattEngine::new();
+        let lang = import_tail_lang();
+        // Bare `import id` — the optional `from` step is skipped and no
+        // `path` is recorded.
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.import", "import"),
+            tok("token.ident", "id"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.len(), 2);
+        let import = &ast.nodes()[1];
+        assert_eq!(import.kind, "stmt.import");
+        assert!(import.payload.get("path").is_none());
     }
 
     #[test]
