@@ -7,7 +7,7 @@
 
 [[repos]]
 name = "handl-lang/engine-parse-pratt"
-dir = "/home/luis/GitHub/handl-lang/engine-parse-pratt"
+dir = "~/GitHub/handl-lang/engine-parse-pratt"
 branch = "refs/heads/main"
   [repos.runner]
   kind = "script"
