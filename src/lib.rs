@@ -657,11 +657,7 @@ impl PrattEngine {
             self.lower_family_record(&data_kind, &plan, is_root);
         }
         if !saw_root_plan && self.ast.borrow().len() > orig_len && orig_len > 0 {
-            let root_node = self
-                .ast
-                .borrow()
-                .get(AstRef::new(orig_len - 1))
-                .cloned();
+            let root_node = self.ast.borrow().get(AstRef::new(orig_len - 1)).cloned();
             if let Some(node) = root_node {
                 self.ast.borrow_mut().push(node);
             }
@@ -1574,8 +1570,7 @@ impl PrattEngine {
                     // The matched token is not the opener; treat the step as
                     // a plain token capture.
                     if let Some(field) = &step.field {
-                        payload_fields
-                            .insert(field.clone(), self.atom_payload(lang, &tok));
+                        payload_fields.insert(field.clone(), self.atom_payload(lang, &tok));
                     }
                     continue;
                 }
@@ -2671,7 +2666,9 @@ mod tests {
         let mut newline = TokenKindDef::new("token.newline");
         newline.layout = true;
         lang.tokens.merge(newline).unwrap();
-        lang.tokens.merge(TokenKindDef::new("token.import")).unwrap();
+        lang.tokens
+            .merge(TokenKindDef::new("token.import"))
+            .unwrap();
         lang.tokens.merge(TokenKindDef::new("token.from")).unwrap();
         lang.tokens.merge(TokenKindDef::new("token.ident")).unwrap();
         lang.tokens

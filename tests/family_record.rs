@@ -11,10 +11,10 @@
 //! nullary ctors vanished from the desugared family.
 
 use handl_kit_data_prelude::language_from_yaml;
+use handl_language::{Ast, AstNode, AstRef};
 use hnl_tool_lex_pattern::lex;
 use hnl_tool_parse::{ParserEngine, ParserRequest};
 use hnl_tool_parse_pratt::PrattEngine;
-use handl_language::{Ast, AstNode, AstRef};
 
 fn parse_family(src: &str) -> Ast {
     let lang = language_from_yaml().expect("canonical language assembles");
@@ -97,9 +97,8 @@ fn bare_and_indexed_nullary_ctors_in_one_family() {
     // `Zero : Nat`-style bare ctor next to an indexed one — the bare ctor
     // stays unwrapped (the checker's bare-index convention hangs off the
     // absent annotation).
-    let ast = parse_family(
-        "Vec<n : Nat, a : Type> := {\n  VNil : Vec(0, a),\n  VHead : Vec(n, a)\n}\n",
-    );
+    let ast =
+        parse_family("Vec<n : Nat, a : Type> := {\n  VNil : Vec(0, a),\n  VHead : Vec(n, a)\n}\n");
     let data = ast.nodes().last().expect("arena root");
     assert_eq!(data.kind, "data");
     let mut ctors = Vec::new();
@@ -108,9 +107,7 @@ fn bare_and_indexed_nullary_ctors_in_one_family() {
     // Both ctors here carry a result index vector, so both are wrapped.
     for c in &ctors {
         assert_eq!(c.kind, "type-annot", "ctor {:?} wrapped once", c.payload);
-        let subject = ast
-            .get(AstRef::new(children_of(c)[0]))
-            .expect("subject");
+        let subject = ast.get(AstRef::new(children_of(c)[0])).expect("subject");
         assert_eq!(subject.kind, "var", "single wrap — leaf is var");
     }
 }
