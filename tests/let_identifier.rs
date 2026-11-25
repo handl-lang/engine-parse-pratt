@@ -39,8 +39,9 @@ fn let_parses_as_plain_var() {
 
 #[test]
 fn let_is_a_valid_binding_target() {
-    // `let = 1` — `let` is the assign target, not a keyword.
-    let ast = parse("let = 1");
+    // `let := 1` — `let` is the assign target, not a keyword. (`:=` is the
+    // only binder; `=` is `binary.eq` equality and never assigns.)
+    let ast = parse("let := 1");
     let root = ast.nodes().last().expect("arena root");
     assert_eq!(root.kind, "assign");
     let kids = children_of(root);
@@ -48,6 +49,15 @@ fn let_is_a_valid_binding_target() {
     let target = ast.get(AstRef::new(kids[0])).expect("target node");
     assert_eq!(target.kind, "var");
     assert_eq!(target.payload.as_str(), Some("let"));
+}
+
+#[test]
+fn let_eq_is_equality_not_assignment() {
+    // `let = 1` — post-`:=` migration `=` lexes as `token.equal` and
+    // parses as `binary.eq`, never `assign`.
+    let ast = parse("let = 1");
+    let root = ast.nodes().last().expect("arena root");
+    assert_eq!(root.kind, "binary.eq");
 }
 
 #[test]
