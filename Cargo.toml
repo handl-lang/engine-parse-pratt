@@ -24,3 +24,40 @@ handl-test-utils = { git = "https://github.com/handl-lang/host", branch = "main"
 hnl-tool-lex-pattern = { git = "https://github.com/handl-lang/tool-lex-pattern", branch = "main" }
 handl-kit-data-prelude = { git = "https://github.com/handl-lang/host", branch = "main" }
 serde_json = "1"
+
+# dev-link: begin
+[patch."https://github.com/handl-lang/engine"]
+hnl-engine = { path = "../engine" }
+[patch."https://github.com/handl-lang/exec"]
+hnl-exec = { path = "../exec" }
+[patch."https://github.com/handl-lang/host"]
+handl-kit-arrow-lower = { path = "../host/crates/handl-kit-arrow-lower" }
+handl-kit-data = { path = "../host/crates/handl-kit-data" }
+handl-kit-data-prelude = { path = "../host/crates/handl-kit-data-prelude" }
+handl-kit-prelude-lang = { path = "../host/crates/handl-kit-prelude-lang" }
+handl-runtime = { path = "../host/crates/handl-runtime" }
+handl-test-utils = { path = "../host/crates/handl-test-utils" }
+handl-pkg-vendor = { path = "../host/crates/pkg-vendor" }
+handl-platform = { path = "../host/crates/platform" }
+handl-plugin-ext-diag = { path = "../host/crates/plugin-ext-diag" }
+handl-plugin-module = { path = "../host/crates/plugin-module" }
+[patch."https://github.com/handl-lang/kernel"]
+handl-calculus = { path = "../kernel/crates/handl-calculus" }
+handl-language = { path = "../kernel/crates/handl-language" }
+handl-ops = { path = "../kernel/crates/handl-ops" }
+handl-value = { path = "../kernel/crates/handl-value" }
+[patch."https://github.com/handl-lang/tool-lex"]
+hnl-tool-lex = { path = "../tool-lex" }
+[patch."https://github.com/handl-lang/tool-lex-pattern"]
+hnl-tool-lex-pattern = { path = "../tool-lex-pattern" }
+[patch."https://github.com/handl-lang/tool-parse"]
+hnl-tool-parse = { path = "../tool-parse" }
+[patch."https://github.com/handl-lang/tool-parse-pratt"]
+hnl-tool-parse-pratt = { path = "../tool-parse-pratt" }
+[patch."https://github.com/handl-lang/tool-transform"]
+hnl-tool-transform = { path = "../tool-transform" }
+[patch."https://github.com/handl-lang/tool-transform-rewrite"]
+hnl-tool-transform-rewrite = { path = "../tool-transform-rewrite" }
+[patch."https://github.com/handl-lang/tool-typecheck"]
+hnl-tool-typecheck = { path = "../tool-typecheck" }
+# dev-link: end
