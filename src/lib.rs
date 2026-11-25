@@ -458,6 +458,136 @@ impl PrattEngine {
             .unwrap_or(false)
     }
 
+    // ---------------------------------------------------------------------
+    // Keyword call-form (apply-forms unification, Route A —
+    // `project/design/apply-forms-unification.md`)
+    //
+    // A prefix row whose children are a fixed-arity, all-required-comma
+    // list (`J p, motive, base`) may *also* be spelled in call form
+    // `J(p, motive, base)`, producing the same `node_kind` node. This is a
+    // parser special production alongside `dimension_applies`: one grammar
+    // row per `token@position` cannot declare both spellings, and a
+    // `delimited` block is unconditional once declared.
+    // ---------------------------------------------------------------------
+
+    /// Whether a prefix [`AstShapeRef`] is a *comma-separated application*
+    /// shape — the data-driven guard for the keyword call-form production.
+    ///
+    /// A shape qualifies when it is a fixed-arity form whose every
+    /// inter-child separator accepts only the comma token, and none of the
+    /// conditional-structure fields (`delimited`, `payload_tokens`,
+    /// `optional_children`, `keyword_clauses`, `block_children`,
+    /// `child_binding_powers`, `payload_extract`, `trailing_tokens`,
+    /// `left_kinds`) is declared. In the canonical kit this selects exactly
+    /// the cubical eliminator rows (`glue`, `j`, `transp`, `hcomp`,
+    /// `comp`, `trans`) and excludes `forall`/`exists` (per-child binding
+    /// powers / keyword clauses), `if` (optional children, block children),
+    /// and every delimited or payload-token form.
+    fn is_comma_application_shape(lang: &Language, shape: &AstShapeRef) -> bool {
+        if shape.arity <= 1
+            || shape.delimited.is_some()
+            || !shape.payload_tokens.is_empty()
+            || !shape.optional_children.is_empty()
+            || !shape.keyword_clauses.is_empty()
+            || !shape.block_children.is_empty()
+            || !shape.child_binding_powers.is_empty()
+            || !shape.payload_extract.is_empty()
+            || !shape.trailing_tokens.is_empty()
+            || !shape.left_kinds.is_empty()
+            || shape.child_separators.len() != shape.arity - 1
+        {
+            return false;
+        }
+        let comma = Self::kind_for_label(lang, ",", "token.comma");
+        shape.child_separators.iter().all(|sep| match sep {
+            ChildSeparator::Required(k) => k == comma,
+            ChildSeparator::OneOf(kinds) => !kinds.is_empty() && kinds.iter().all(|k| k == comma),
+            ChildSeparator::Optional(_) => false,
+        })
+    }
+
+    /// Try the keyword call-form production: `Kw(a, b, …)` for a prefix row
+    /// whose child shape is a comma-separated application
+    /// ([`Self::is_comma_application_shape`]).
+    ///
+    /// Fires only when the token *immediately after* the just-consumed
+    /// prefix token is `(` **byte-adjacent** to it (mirroring
+    /// `dimension_applies`' adjacency rule). Adjacency — not merely
+    /// same-line — is what keeps `J (p), q` parsing as the keyword form
+    /// applied to a parenthesized first child: `J(p)` is unambiguously the
+    /// call spelling, `J (…)` keeps the keyword reading.
+    ///
+    /// The parenthesized list is parsed with the same delimited machinery
+    /// as `call`/`paren` (comma-separated elements at rbp 0, trailing comma
+    /// tolerated), and the row's `node_kind` node is built with those
+    /// elements as children — literally the same node the keyword form
+    /// produces, so `ast.*`/`eval.*`/`type.*` need no changes. Arity must
+    /// match the row exactly (`trans(p)` is a parse error, as `trans p`
+    /// is).
+    ///
+    /// Returns `Ok(None)` — cursor untouched — when the production does not
+    /// apply; `Err` on a malformed call form.
+    fn try_keyword_call_form(
+        &self,
+        lang: &Language,
+        cursor: &mut Cursor<'_>,
+        token: &Token,
+        shape: &AstShapeRef,
+    ) -> Result<Option<AstRef>, LangError> {
+        if !Self::is_comma_application_shape(lang, shape) {
+            return Ok(None);
+        }
+        let lparen = Self::kind_for_label(lang, "(", "token.lparen");
+        let Some(idx) = cursor.peek_index() else {
+            return Ok(None);
+        };
+        let Some(next) = cursor.tokens.get(idx) else {
+            return Ok(None);
+        };
+        if next.kind != lparen || next.start != token.end {
+            return Ok(None);
+        }
+        // Parse `(a, b, …)` exactly like a call argument list.
+        let delim = DelimitedShape {
+            open: lparen.into(),
+            close: Self::closing_kind(lang, lparen, "token.rparen").into(),
+            separator: Some(Self::kind_for_label(lang, ",", "token.comma").into()),
+            container_kind: shape.node_kind.clone(),
+            pair: None,
+            open_is_operator_token: false,
+            flatten: true,
+            rest_token: None,
+            newline_separator: false,
+        };
+        let elements = match self.parse_delimited_block(lang, cursor, &delim)? {
+            DelimitedResult::Elements(indices) => indices,
+            DelimitedResult::Container(idx) => vec![idx],
+        };
+        if elements.len() != shape.arity {
+            return Err(LangError::engine_at(
+                format!(
+                    "{}: call form expects {} argument(s), got {}",
+                    shape.node_kind,
+                    shape.arity,
+                    elements.len()
+                ),
+                cursor.last_span(),
+                Some("token".to_string()),
+            ));
+        }
+        let mut payload_fields: serde_json::Map<String, Value> = serde_json::Map::new();
+        payload_fields.insert(
+            "children".to_string(),
+            Value::Array(elements.iter().map(|i| Value::from(*i)).collect()),
+        );
+        let span = Self::span_union(token.span(), cursor.last_span());
+        Ok(Some(self.push_spanned(
+            shape.node_kind.as_str(),
+            Value::Object(payload_fields),
+            span,
+        )))
+    }
+
     /// Whether the `{` at the cursor opens a **record literal** rather
     /// than a `block` — the `x ~> {k: v}` disambiguation (phase-3 WS-F).
     ///
@@ -1072,7 +1202,15 @@ impl PrattEngine {
         // `AstShapeRef::trailing_tokens` (the required `import * as <alias>`
         // tail, alias captured into `payload.alias`) plus a `required`
         // `payload_extract` step lifting the path string into `payload.path`.
-        let left = if arity == 0 && delim.is_none() && shape.payload_tokens.is_empty() {
+        // Keyword call-form (`J(p, motive, base)` ≡ `J p, motive, base`,
+        // apply-forms Route A): when the prefix row is a comma-separated
+        // application shape and `(` is byte-adjacent, the parenthesized
+        // comma list becomes the row's node_kind children — the same node
+        // the keyword form produces. Checked before the generic prefix
+        // parse; returns `None` (cursor untouched) for every other shape.
+        let left = if let Some(node) = self.try_keyword_call_form(lang, cursor, &token, shape)? {
+            node
+        } else if arity == 0 && delim.is_none() && shape.payload_tokens.is_empty() {
             // Atom: payload is the token's interpreted value (dispatches on
             // LiteralKind — no substring matching).
             let payload = self.atom_payload(lang, &token);
@@ -4737,6 +4875,170 @@ mod tests {
             let children = root.payload.get("children").unwrap().as_array().unwrap();
             assert_eq!(children.len(), n, "child count for {}", expected);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Keyword call-form (apply-forms Route A): `Kw(a, b, …)` for
+    // comma-separated prefix rows produces the same node as `Kw a, b, …`.
+    // -----------------------------------------------------------------
+
+    /// `j(p, M, a)` and `j p, M, a` build literally the same `j` node.
+    #[test]
+    fn keyword_call_form_matches_keyword_form() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        let call_form = engine
+            .parse(
+                &lang,
+                &ParserRequest::new(Tokens(vec![
+                    tok("token.keyword.j", "j"),
+                    tok("token.lparen", "("),
+                    tok("token.identifier", "p"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "M"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "a"),
+                    tok("token.rparen", ")"),
+                ])),
+            )
+            .unwrap();
+        let keyword_form = engine
+            .parse(
+                &lang,
+                &ParserRequest::new(Tokens(vec![
+                    tok("token.keyword.j", "j"),
+                    tok("token.identifier", "p"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "M"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "a"),
+                ])),
+            )
+            .unwrap();
+        let call_root = call_form.nodes().last().unwrap();
+        let kw_root = keyword_form.nodes().last().unwrap();
+        assert_eq!(call_root.kind, "j");
+        assert_eq!(call_root.kind, kw_root.kind);
+        assert_eq!(call_root.payload, kw_root.payload);
+    }
+
+    /// `glue(A, p)` — the two-argument comma row — also parses in call form.
+    #[test]
+    fn keyword_call_form_two_arg_row() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        let ast = engine
+            .parse(
+                &lang,
+                &ParserRequest::new(Tokens(vec![
+                    tok("token.keyword.glue", "glue"),
+                    tok("token.lparen", "("),
+                    tok("token.identifier", "A"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "p"),
+                    tok("token.rparen", ")"),
+                ])),
+            )
+            .unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "glue");
+        assert_eq!(
+            root.payload["children"].as_array().unwrap().len(),
+            2,
+            "glue call form has two children"
+        );
+    }
+
+    /// Arity is enforced: `j(p, M)` is a parse error, like `j p, M`.
+    #[test]
+    fn keyword_call_form_arity_mismatch_errors() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        let result = engine.parse(
+            &lang,
+            &ParserRequest::new(Tokens(vec![
+                tok("token.keyword.j", "j"),
+                tok("token.lparen", "("),
+                tok("token.identifier", "p"),
+                tok("token.comma", ","),
+                tok("token.identifier", "M"),
+                tok("token.rparen", ")"),
+            ])),
+        );
+        assert!(result.is_err(), "j(p, M) must fail — j takes 3 args");
+    }
+
+    /// The `(` must be byte-adjacent to the keyword: `j (p, M, a)` keeps
+    /// the keyword reading — the paren becomes child 0 and the required
+    /// `,` separator then fails (same as before the production existed).
+    #[test]
+    fn keyword_call_form_requires_adjacency() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // `j` at [0,1), space, `(` at [2,3) — not adjacent.
+        let result = engine.parse(
+            &lang,
+            &ParserRequest::new(Tokens(vec![
+                spanned_tok("token.keyword.j", "j", 0, 1),
+                spanned_tok("token.lparen", "(", 2, 3),
+                spanned_tok("token.identifier", "p", 3, 4),
+                spanned_tok("token.comma", ",", 4, 5),
+                spanned_tok("token.identifier", "M", 6, 7),
+                spanned_tok("token.comma", ",", 7, 8),
+                spanned_tok("token.identifier", "a", 9, 10),
+                spanned_tok("token.rparen", ")", 10, 11),
+            ])),
+        );
+        assert!(
+            result.is_err(),
+            "j (…) with a space keeps the keyword reading and must fail"
+        );
+        // Same tokens, `(` adjacent at [1,2): the call form fires.
+        let ast = engine
+            .parse(
+                &lang,
+                &ParserRequest::new(Tokens(vec![
+                    spanned_tok("token.keyword.j", "j", 0, 1),
+                    spanned_tok("token.lparen", "(", 1, 2),
+                    spanned_tok("token.identifier", "p", 2, 3),
+                    spanned_tok("token.comma", ",", 3, 4),
+                    spanned_tok("token.identifier", "M", 5, 6),
+                    spanned_tok("token.comma", ",", 6, 7),
+                    spanned_tok("token.identifier", "a", 8, 9),
+                    spanned_tok("token.rparen", ")", 9, 10),
+                ])),
+            )
+            .unwrap();
+        assert_eq!(ast.nodes().last().unwrap().kind, "j");
+    }
+
+    /// A keyword call-form node still participates in the infix loop:
+    /// `glue(A, p) # v` binds `#` outside the `glue` node.
+    #[test]
+    fn keyword_call_form_binds_infix_operators() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        let ast = engine
+            .parse(
+                &lang,
+                &ParserRequest::new(Tokens(vec![
+                    tok("token.keyword.glue", "glue"),
+                    tok("token.lparen", "("),
+                    tok("token.identifier", "A"),
+                    tok("token.comma", ","),
+                    tok("token.identifier", "p"),
+                    tok("token.rparen", ")"),
+                    tok("token.sharp", "#"),
+                    tok("token.identifier", "v"),
+                ])),
+            )
+            .unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "transport");
+        let children = root.payload["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        let left_idx = children[0].as_u64().unwrap() as usize;
+        assert_eq!(ast.nodes()[left_idx].kind, "glue");
     }
 
     // -----------------------------------------------------------------
