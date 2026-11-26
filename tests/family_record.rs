@@ -134,3 +134,111 @@ fn inner_family_record_keeps_enclosing_root() {
     let first = ast.get(AstRef::new(kids[0])).expect("first statement");
     assert_eq!(first.kind, "data", "family decl lowered in place");
 }
+
+// ---------------------------------------------------------------------------
+// PL-0003 I2 — `X := new Inductive { … }` lowers to the same `data` node
+// (the `Inductive` schema of the unified `new` registry).
+// ---------------------------------------------------------------------------
+
+/// The lowered `data` node for `src` — panics unless the declaration
+/// lowered (single-statement chunk: the `data` node is the arena root).
+fn lowered_data(ast: &Ast) -> &AstNode {
+    let data = ast.nodes().last().expect("arena root");
+    assert_eq!(data.kind, "data", "new Inductive lowers to `data`");
+    data
+}
+
+#[test]
+fn new_inductive_lowers_to_data_nullary_and_arged_ctors() {
+    // `Nat := new Inductive { zero : Nat, succ : (pred : Nat) ~> Nat }` —
+    // the graded-arrows.md §3 surface. Must produce the identical `data`
+    // node the record spelling `Nat := { … }` produces.
+    let ast = parse_family(
+        "Nat := new Inductive {\n  zero : Nat,\n  succ : (pred : Nat) ~> Nat\n}\n",
+    );
+    let data = lowered_data(&ast);
+    assert_eq!(data.payload.get("name").and_then(|v| v.as_str()), Some("Nat"));
+    let data_children = children_of(data);
+    assert_eq!(data_children.len(), 2, "data children [type, ctors]");
+    // The family head is the assign target `var Nat`.
+    let head = ast.get(AstRef::new(data_children[0])).expect("head");
+    assert_eq!(head.kind, "var");
+    assert_eq!(head.payload.as_str(), Some("Nat"));
+
+    let mut ctors = Vec::new();
+    ctor_leaves(&ast, data_children[1], &mut ctors);
+    assert_eq!(ctors.len(), 2, "two constructors: {ctors:?}");
+    // Ctor identity lives either in the `type-annot` payload's `name`
+    // (wrapped ctors) or as the leaf's own string payload (bare ctors).
+    let ctor_name = |n: &AstNode| {
+        n.payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| n.payload.as_str())
+            .map(str::to_string)
+    };
+    let zero = ctors
+        .iter()
+        .find(|n| ctor_name(n).as_deref() == Some("zero"))
+        .expect("zero ctor");
+    // `zero : Nat` — bare nullary ctor: unwrapped `var` leaf.
+    assert_eq!(zero.kind, "var", "bare ctor stays a var leaf");
+    assert_eq!(zero.payload.as_str(), Some("zero"));
+    let succ = ctors
+        .iter()
+        .find(|n| ctor_name(n).as_deref() == Some("succ"))
+        .expect("succ ctor");
+    // `succ : (pred : Nat) ~> Nat` — `call` leaf under one `type-annot`.
+    assert_eq!(succ.kind, "type-annot");
+    let subject = ast
+        .get(AstRef::new(children_of(succ)[0]))
+        .expect("succ subject");
+    assert_eq!(subject.kind, "call", "succ leaf is the arg `call`");
+}
+
+#[test]
+fn new_inductive_lowers_indexed_family_with_params() {
+    // Params ride the assign target exactly like the record spelling:
+    // `Vec(n : Nat, a : Type) := new Inductive { … }`.
+    let ast = parse_family(
+        "Vec(n : Nat, a : Type) := new Inductive {\n  vnil  : Vec(0, a),\n  vcons : (x : a, xs : Vec(n, a)) ~> Vec(n + 1, a)\n}\n",
+    );
+    let data = lowered_data(&ast);
+    assert_eq!(data.payload.get("name").and_then(|v| v.as_str()), Some("Vec"));
+    let data_children = children_of(data);
+    let head = ast.get(AstRef::new(data_children[0])).expect("head");
+    assert_eq!(head.kind, "call", "parameterized head stays a call");
+    let mut ctors = Vec::new();
+    ctor_leaves(&ast, data_children[1], &mut ctors);
+    assert_eq!(ctors.len(), 2, "two constructors: {ctors:?}");
+}
+
+#[test]
+fn new_inductive_non_family_codomain_stays_new_node() {
+    // A field whose codomain does not name the declared family is not a
+    // constructor — the `new` node survives for `synth_new_decl` (which
+    // reports `Inductive` honestly) rather than mislowering.
+    let ast = parse_family("Nat := new Inductive {\n  zero : Nat,\n  bad  : String\n}\n");
+    // The assign survives (no `data` node was emitted for it): find the
+    // `new` node still present in the arena.
+    assert!(
+        ast.nodes().iter().any(|n| n.kind == "new"),
+        "unlowered `new Inductive` keeps its new node"
+    );
+    assert!(
+        !ast.nodes().iter().any(|n| n.kind == "data"),
+        "no data node for a non-ctor field"
+    );
+}
+
+#[test]
+fn new_inductive_inside_block_lowers_in_place() {
+    let ast = parse_family(
+        "do {\n  Nat := new Inductive { zero : Nat, succ : (pred : Nat) ~> Nat }\n  succ(zero)\n}\n",
+    );
+    let root = ast.nodes().last().expect("arena root");
+    assert_eq!(root.kind, "block", "root stays the enclosing block");
+    let kids = children_of(root);
+    let first = ast.get(AstRef::new(kids[0])).expect("first statement");
+    assert_eq!(first.kind, "data", "new Inductive lowered in place");
+}

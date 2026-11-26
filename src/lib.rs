@@ -806,7 +806,9 @@ impl PrattEngine {
             (
                 (0..ast.len())
                     .filter_map(|idx| {
-                        family_record_plan(lang, &ast, idx).map(|plan| (plan, Some(idx) == root))
+                        family_record_plan(lang, &ast, idx)
+                            .or_else(|| new_inductive_plan(lang, &ast, idx))
+                            .map(|plan| (plan, Some(idx) == root))
                     })
                     .collect::<Vec<_>>(),
                 orig_len,
@@ -2533,6 +2535,114 @@ fn family_ctor_plan(
         result: Some(child_index(field, child_slot(lang, field, "body", 1))?),
         args,
         ..bare
+    })
+}
+
+/// The `new` node kind (`ast.yaml` `ast.new`) and the `Inductive` schema
+/// head of the unified `new` registry
+/// (design/instance-unified-registry.md §2). `Algebra`/`Constraint`
+/// keep their `new` nodes for `synth_new_decl`'s schema dispatch;
+/// `Inductive` lowers to `data` here instead (see
+/// [`new_inductive_plan`]).
+const NEW_NODE_KIND: &str = "new";
+const INDUCTIVE_SCHEMA: &str = "Inductive";
+
+/// Read the `assign` node at `idx` as a `new Inductive` family
+/// declaration (PL-0003 I2), or `None`.
+///
+/// `X := new Inductive { C : Sig, … }` is the `Inductive` schema of the
+/// unified `new` registry — declaration sugar over the family-record
+/// machinery (graded-arrows.md §3: "desugars to the existing
+/// record-spelling/data-family machinery — no new semantics"). Lowering
+/// here — alongside the record spelling — emits the *same* internal
+/// `data` node, so the checker binds the family/ctors **and** the
+/// `inductive.spec` value (`<X>.spec`, PL-0003 I1/I2), the desugar pass
+/// emits the ordinary former/ctors/`F.rec` runtime shape, `match`
+/// resolves through `scan_data`, and positivity runs through the
+/// ordinary `data` paths — "same bindings as `data` plus the spec
+/// binding" with zero downstream changes.
+///
+/// The plan is deliberately narrow, mirroring [`family_record_plan`]'s
+/// "a binding that fails any test stays a plain binding" discipline:
+///
+/// - the value must be a `new` node whose `type` child is the **bare**
+///   `Inductive` head (`new Inductive(…)` keeps the `new` node — schema
+///   args have no inductive meaning yet);
+/// - the `dict` child must be a record literal;
+/// - every field must read cleanly as a constructor of the declared
+///   family through [`family_ctor_plan`] — the exact field reading the
+///   record spelling uses (`C : F`, `C : F(i⃗)`, `C : (a⃗) ~> R`).
+///
+/// Anything else returns `None`: the `new` node survives for
+/// `synth_new_decl`'s schema dispatch (which reports `Inductive`
+/// honestly rather than misbinding a mode family).
+fn new_inductive_plan(lang: &Language, ast: &Ast, idx: usize) -> Option<FamilyRecordPlan> {
+    // A language declaring no `new` shape gets no Inductive lowering.
+    let new_shape = lang.ast.get_by_identity(NEW_NODE_KIND)?;
+    let new_kind = new_shape.node_kind.clone();
+    let node = ast.get(AstRef::new(idx))?;
+    if !is_binding_node(lang, node) {
+        return None;
+    }
+    let target_idx = child_index(node, child_slot(lang, node, "target", 0))?;
+    let value_idx = child_index(node, child_slot(lang, node, "value", 1))?;
+    let target = ast.get(AstRef::new(target_idx))?;
+    let value = ast.get(AstRef::new(value_idx))?;
+    if value.kind != new_kind {
+        return None;
+    }
+    let type_idx = child_index(value, child_slot(lang, value, "type", 0))?;
+    let dict_idx = child_index(value, child_slot(lang, value, "dict", 1))?;
+    // Bare `Inductive` head only — `node_name` reads the name-atom
+    // payload (`var Inductive`); a `call`/`index_app` schema
+    // application returns `None` and keeps the `new` node.
+    let schema = ast.get(AstRef::new(type_idx))?;
+    if node_name(schema)? != INDUCTIVE_SCHEMA {
+        return None;
+    }
+    let family = head_name(lang, ast, target)?;
+    let dict = ast.get(AstRef::new(dict_idx))?;
+    if !is_record_node(lang, dict) {
+        return None;
+    }
+    let mut ctors = Vec::new();
+    for field_idx in node_children(dict) {
+        let field = ast.get(AstRef::new(field_idx))?;
+        if !is_entry_node(lang, field) {
+            return None;
+        }
+        let key_idx = child_index(field, child_slot(lang, field, "key", 0))?;
+        let field_value_idx = child_index(field, child_slot(lang, field, "value", 1))?;
+        // A computed key (`[expr]: …`) is not a constructor name.
+        let name = node_name(ast.get(AstRef::new(key_idx))?)?.to_string();
+        ctors.push(family_ctor_plan(
+            lang,
+            ast,
+            name,
+            key_idx,
+            field_value_idx,
+            &family,
+        )?);
+    }
+    if ctors.is_empty() {
+        return None;
+    }
+    Some(FamilyRecordPlan {
+        node_idx: idx,
+        family,
+        head_idx: target_idx,
+        ctors,
+        span: {
+            let a = ast.get(AstRef::new(target_idx)).and_then(|n| n.span);
+            let b = ast.get(AstRef::new(value_idx)).and_then(|n| n.span);
+            match (a, b) {
+                (Some(a), Some(b)) => Some(Span {
+                    start: a.start.min(b.start),
+                    end: a.end.max(b.end),
+                }),
+                (a, b) => a.or(b),
+            }
+        },
     })
 }
 
