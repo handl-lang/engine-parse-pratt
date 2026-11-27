@@ -711,6 +711,46 @@ impl PrattEngine {
         (state == 0 && completed > 0) || state == 2
     }
 
+    /// Whether the payload of a `~[…]~>` (`dim_open`) infix is a *bare
+    /// numeric literal* — the only payload that keeps the legacy
+    /// `dim_arrow` node kind after the payload-kind flip
+    /// (graded-arrows.md §9). Every other payload (identifier, call,
+    /// record, expression) mints `graded_arrow`; the `~>[…]`
+    /// (`dim_arrow_open`) spelling stays `dim_arrow` for every payload —
+    /// it is the unambiguous dimension form post-codemod.
+    ///
+    /// `cursor` must be positioned just after the dim-open operator
+    /// token. "Bare" means the literal is the *whole* payload: the next
+    /// non-ignorable token has to be the bracket close (`]~>`), so
+    /// `~[2]~>` is a dimension while `~[(2)]~>` and `~[2 + 1]~>` are
+    /// grades.
+    fn dim_arrow_payload_is_numeric(lang: &Language, cursor: &Cursor<'_>, open_kind: &str) -> bool {
+        let Some(i) = cursor.peek_index() else {
+            return false;
+        };
+        let Some(first) = cursor.tokens.get(i) else {
+            return false;
+        };
+        // Data-driven numeric check: the token's declared `literal`
+        // dispatch is `LiteralKind::Number` — never a kind-string match.
+        let is_number = lang
+            .token_kind(&first.kind)
+            .and_then(|d| d.literal.as_ref())
+            == Some(&LiteralKind::Number);
+        if !is_number {
+            return false;
+        }
+        let close = Self::closing_kind(lang, open_kind, "token.dim_close");
+        let mut j = i + 1;
+        while let Some(t) = cursor.tokens.get(j) {
+            if !cursor.ignorable(&t.kind) {
+                return t.kind == close;
+            }
+            j += 1;
+        }
+        false
+    }
+
     // -----------------------------------------------------------------------
     // ADR-0158 — the one-declaration family surface
     // -----------------------------------------------------------------------
@@ -766,7 +806,9 @@ impl PrattEngine {
             (
                 (0..ast.len())
                     .filter_map(|idx| {
-                        family_record_plan(lang, &ast, idx).map(|plan| (plan, Some(idx) == root))
+                        family_record_plan(lang, &ast, idx)
+                            .or_else(|| new_inductive_plan(lang, &ast, idx))
+                            .map(|plan| (plan, Some(idx) == root))
                     })
                     .collect::<Vec<_>>(),
                 orig_len,
@@ -1504,9 +1546,26 @@ impl PrattEngine {
             }
 
             // Consume the operator token.
-            let _op = cursor.advance()?;
+            let op_tok = cursor.advance()?;
 
-            let infix_kind = &shape.node_kind;
+            // Payload-kind flip (graded-arrows.md §9, M5 transition
+            // cleanup): the `~[…]~>` spelling (`grammar.dim_arrow.infix`
+            // on the dim-open token) mints `graded_arrow` for every
+            // payload EXCEPT a bare numeric literal, which keeps the
+            // legacy `dim_arrow` reading — the codemod moved all real
+            // dimension sites to the `~>[…]` spelling
+            // (`grammar.dim_arrow.bare.infix`), which stays `dim_arrow`
+            // for every payload. The grammar row cannot express a
+            // payload-conditional node kind, so the flip lives here at
+            // the sanctioned special-case point; `graded_arrow` shares
+            // the dim row's ternary shape (source/grade|dim/target).
+            let infix_kind: &str = if infix_row.id == "grammar.dim_arrow.infix"
+                && !Self::dim_arrow_payload_is_numeric(lang, cursor, &op_tok.kind)
+            {
+                "graded_arrow"
+            } else {
+                shape.node_kind.as_str()
+            };
             let infix_arity = shape.arity;
             let delim = shape.delimited.as_ref();
 
@@ -1627,7 +1686,7 @@ impl PrattEngine {
             let payload = Value::Object(payload_fields);
             let start = self.child_span(left);
             let span = Self::span_union(start, cursor.last_span());
-            left = self.push_spanned(infix_kind.as_str(), payload, span);
+            left = self.push_spanned(infix_kind, payload, span);
         }
 
         Ok(left)
@@ -2476,6 +2535,114 @@ fn family_ctor_plan(
         result: Some(child_index(field, child_slot(lang, field, "body", 1))?),
         args,
         ..bare
+    })
+}
+
+/// The `new` node kind (`ast.yaml` `ast.new`) and the `Inductive` schema
+/// head of the unified `new` registry
+/// (design/instance-unified-registry.md §2). `Algebra`/`Constraint`
+/// keep their `new` nodes for `synth_new_decl`'s schema dispatch;
+/// `Inductive` lowers to `data` here instead (see
+/// [`new_inductive_plan`]).
+const NEW_NODE_KIND: &str = "new";
+const INDUCTIVE_SCHEMA: &str = "Inductive";
+
+/// Read the `assign` node at `idx` as a `new Inductive` family
+/// declaration (PL-0003 I2), or `None`.
+///
+/// `X := new Inductive { C : Sig, … }` is the `Inductive` schema of the
+/// unified `new` registry — declaration sugar over the family-record
+/// machinery (graded-arrows.md §3: "desugars to the existing
+/// record-spelling/data-family machinery — no new semantics"). Lowering
+/// here — alongside the record spelling — emits the *same* internal
+/// `data` node, so the checker binds the family/ctors **and** the
+/// `inductive.spec` value (`<X>.spec`, PL-0003 I1/I2), the desugar pass
+/// emits the ordinary former/ctors/`F.rec` runtime shape, `match`
+/// resolves through `scan_data`, and positivity runs through the
+/// ordinary `data` paths — "same bindings as `data` plus the spec
+/// binding" with zero downstream changes.
+///
+/// The plan is deliberately narrow, mirroring [`family_record_plan`]'s
+/// "a binding that fails any test stays a plain binding" discipline:
+///
+/// - the value must be a `new` node whose `type` child is the **bare**
+///   `Inductive` head (`new Inductive(…)` keeps the `new` node — schema
+///   args have no inductive meaning yet);
+/// - the `dict` child must be a record literal;
+/// - every field must read cleanly as a constructor of the declared
+///   family through [`family_ctor_plan`] — the exact field reading the
+///   record spelling uses (`C : F`, `C : F(i⃗)`, `C : (a⃗) ~> R`).
+///
+/// Anything else returns `None`: the `new` node survives for
+/// `synth_new_decl`'s schema dispatch (which reports `Inductive`
+/// honestly rather than misbinding a mode family).
+fn new_inductive_plan(lang: &Language, ast: &Ast, idx: usize) -> Option<FamilyRecordPlan> {
+    // A language declaring no `new` shape gets no Inductive lowering.
+    let new_shape = lang.ast.get_by_identity(NEW_NODE_KIND)?;
+    let new_kind = new_shape.node_kind.clone();
+    let node = ast.get(AstRef::new(idx))?;
+    if !is_binding_node(lang, node) {
+        return None;
+    }
+    let target_idx = child_index(node, child_slot(lang, node, "target", 0))?;
+    let value_idx = child_index(node, child_slot(lang, node, "value", 1))?;
+    let target = ast.get(AstRef::new(target_idx))?;
+    let value = ast.get(AstRef::new(value_idx))?;
+    if value.kind != new_kind {
+        return None;
+    }
+    let type_idx = child_index(value, child_slot(lang, value, "type", 0))?;
+    let dict_idx = child_index(value, child_slot(lang, value, "dict", 1))?;
+    // Bare `Inductive` head only — `node_name` reads the name-atom
+    // payload (`var Inductive`); a `call`/`index_app` schema
+    // application returns `None` and keeps the `new` node.
+    let schema = ast.get(AstRef::new(type_idx))?;
+    if node_name(schema)? != INDUCTIVE_SCHEMA {
+        return None;
+    }
+    let family = head_name(lang, ast, target)?;
+    let dict = ast.get(AstRef::new(dict_idx))?;
+    if !is_record_node(lang, dict) {
+        return None;
+    }
+    let mut ctors = Vec::new();
+    for field_idx in node_children(dict) {
+        let field = ast.get(AstRef::new(field_idx))?;
+        if !is_entry_node(lang, field) {
+            return None;
+        }
+        let key_idx = child_index(field, child_slot(lang, field, "key", 0))?;
+        let field_value_idx = child_index(field, child_slot(lang, field, "value", 1))?;
+        // A computed key (`[expr]: …`) is not a constructor name.
+        let name = node_name(ast.get(AstRef::new(key_idx))?)?.to_string();
+        ctors.push(family_ctor_plan(
+            lang,
+            ast,
+            name,
+            key_idx,
+            field_value_idx,
+            &family,
+        )?);
+    }
+    if ctors.is_empty() {
+        return None;
+    }
+    Some(FamilyRecordPlan {
+        node_idx: idx,
+        family,
+        head_idx: target_idx,
+        ctors,
+        span: {
+            let a = ast.get(AstRef::new(target_idx)).and_then(|n| n.span);
+            let b = ast.get(AstRef::new(value_idx)).and_then(|n| n.span);
+            match (a, b) {
+                (Some(a), Some(b)) => Some(Span {
+                    start: a.start.min(b.start),
+                    end: a.end.max(b.end),
+                }),
+                (a, b) => a.or(b),
+            }
+        },
     })
 }
 
@@ -3978,6 +4145,81 @@ mod tests {
         lang
     }
 
+    /// [`literal_lang`] plus the canonical `~[…]~>` / `~>[…]` dimension
+    /// tokens and infix rows (mirroring `grammar.dim_arrow.infix` /
+    /// `grammar.dim_arrow.bare.infix` in the kit data), for the
+    /// payload-kind flip tests.
+    fn dim_arrow_lang() -> Language {
+        let mut lang = literal_lang();
+        lang.tokens
+            .merge(
+                TokenKindDef::new("token.dim_open")
+                    .with_label("~[")
+                    .with_category("open-bracket")
+                    .with_pair("token.dim_close"),
+            )
+            .unwrap();
+        lang.tokens
+            .merge(
+                TokenKindDef::new("token.dim_close")
+                    .with_label("]~>")
+                    .with_category("close-bracket")
+                    .with_pair("token.dim_open"),
+            )
+            .unwrap();
+        lang.tokens
+            .merge(
+                TokenKindDef::new("token.dim_arrow_open")
+                    .with_label("~>[")
+                    .with_category("open-bracket")
+                    .with_pair("token.rbracket"),
+            )
+            .unwrap();
+        // `A ~[x]~> B` — canonical dim spelling; the node kind is decided
+        // by the payload (numeric literal → dim_arrow, else graded_arrow).
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "grammar.dim_arrow.infix",
+                    "token.dim_open",
+                    GrammarPosition::Infix,
+                    AstShapeRef::new("dim_arrow", 3).with_child_separators(vec![
+                        ChildSeparator::Required("token.dim_close".into()),
+                    ]),
+                )
+                .with_binding_power(10, 9),
+            )
+            .unwrap();
+        // `A ~>[x] B` — the dimension spelling; dim_arrow for every
+        // payload, no flip.
+        lang.grammar
+            .merge(
+                GrammarRow::new(
+                    "grammar.dim_arrow.bare.infix",
+                    "token.dim_arrow_open",
+                    GrammarPosition::Infix,
+                    AstShapeRef::new("dim_arrow", 3).with_child_separators(vec![
+                        ChildSeparator::Required("token.rbracket".into()),
+                    ]),
+                )
+                .with_binding_power(10, 9),
+            )
+            .unwrap();
+        lang
+    }
+
+    /// The children indices of an infix node's payload.
+    fn root_children(root: &AstNode) -> Vec<usize> {
+        root.payload
+            .get("children")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect()
+    }
+
     #[test]
     fn array_literal_parses_elements() {
         let engine = PrattEngine::new();
@@ -4391,6 +4633,156 @@ mod tests {
             msg.contains("empty grade list"),
             "diagnostic should name the empty grade list, got: {msg}",
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Payload-kind flip (graded-arrows.md §9): `A ~[G]~> B` mints
+    // `graded_arrow` for every payload except a bare numeric literal,
+    // which stays `dim_arrow`; `A ~>[x] B` stays `dim_arrow` always.
+    // ------------------------------------------------------------------
+
+    /// `A ~[2]~> B` — a bare numeric literal keeps the legacy
+    /// `dim_arrow` reading (back-compat for `cell_legacy` and friends).
+    #[test]
+    fn dim_spelling_numeric_payload_stays_dim_arrow() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "A"),
+            tok("token.dim_open", "~["),
+            tok("token.number", "2"),
+            tok("token.dim_close", "]~>"),
+            tok("token.identifier", "B"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "dim_arrow");
+        let children = root_children(root);
+        assert_eq!(children.len(), 3);
+        assert_eq!(ast.nodes()[children[1]].kind, "value");
+        assert_eq!(ast.nodes()[children[1]].payload, json!(2));
+    }
+
+    /// `A ~[N]~> B` — a named payload is a grade, not a dimension:
+    /// mints `graded_arrow` whose middle child is the grade expression.
+    #[test]
+    fn dim_spelling_named_payload_mints_graded_arrow() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "A"),
+            tok("token.dim_open", "~["),
+            tok("token.identifier", "N"),
+            tok("token.dim_close", "]~>"),
+            tok("token.identifier", "B"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "graded_arrow");
+        let children = root_children(root);
+        assert_eq!(children.len(), 3);
+        assert_eq!(ast.nodes()[children[1]].kind, "var");
+        assert_eq!(ast.nodes()[children[1]].payload, json!("N"));
+    }
+
+    /// `A ~[Cost(3)]~> B` — a call payload mints `graded_arrow` with the
+    /// call expression as the grade child.
+    #[test]
+    fn dim_spelling_call_payload_mints_graded_arrow() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "A"),
+            tok("token.dim_open", "~["),
+            tok("token.identifier", "Cost"),
+            tok("token.lparen", "("),
+            tok("token.number", "3"),
+            tok("token.rparen", ")"),
+            tok("token.dim_close", "]~>"),
+            tok("token.identifier", "B"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "graded_arrow");
+        let children = root_children(root);
+        assert_eq!(children.len(), 3);
+        let grade = &ast.nodes()[children[1]];
+        assert_eq!(grade.kind, "call");
+        // The grade child is the full `Cost(3)` call, not just `Cost`.
+        let call_children = grade.payload.get("children").unwrap().as_array().unwrap();
+        assert_eq!(call_children.len(), 2, "call = fn + one arg");
+    }
+
+    /// `A ~[{puts: Str}]~> B` — a record payload mints `graded_arrow`.
+    #[test]
+    fn dim_spelling_record_payload_mints_graded_arrow() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "A"),
+            tok("token.dim_open", "~["),
+            tok("token.lbrace", "{"),
+            tok("token.identifier", "puts"),
+            tok("token.colon", ":"),
+            tok("token.identifier", "Str"),
+            tok("token.rbrace", "}"),
+            tok("token.dim_close", "]~>"),
+            tok("token.identifier", "B"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "graded_arrow");
+        let children = root_children(root);
+        assert_eq!(children.len(), 3);
+        assert_eq!(ast.nodes()[children[1]].kind, "object");
+    }
+
+    /// `A ~[(2)]~> B` — a *parenthesized* numeric is a grade, not a
+    /// dimension: only a bare literal keeps `dim_arrow`.
+    #[test]
+    fn dim_spelling_parenthesized_number_mints_graded_arrow() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        let req = ParserRequest::new(Tokens(vec![
+            tok("token.identifier", "A"),
+            tok("token.dim_open", "~["),
+            tok("token.lparen", "("),
+            tok("token.number", "2"),
+            tok("token.rparen", ")"),
+            tok("token.dim_close", "]~>"),
+            tok("token.identifier", "B"),
+        ]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        let root = ast.nodes().last().unwrap();
+        assert_eq!(root.kind, "graded_arrow");
+    }
+
+    /// `A ~>[x] B` — the bare `~>[…]` spelling is the dimension form:
+    /// `dim_arrow` for numeric AND named payloads alike.
+    #[test]
+    fn bare_spelling_stays_dim_arrow_for_any_payload() {
+        let engine = PrattEngine::new();
+        let lang = dim_arrow_lang();
+        for payload in [
+            vec![tok("token.number", "2")],
+            vec![tok("token.identifier", "N")],
+        ] {
+            let mut toks = vec![
+                tok("token.identifier", "A"),
+                tok("token.dim_arrow_open", "~>["),
+            ];
+            toks.extend(payload);
+            toks.push(tok("token.rbracket", "]"));
+            toks.push(tok("token.identifier", "B"));
+            let ast = engine
+                .parse(&lang, &ParserRequest::new(Tokens(toks)))
+                .unwrap();
+            let root = ast.nodes().last().unwrap();
+            assert_eq!(
+                root.kind, "dim_arrow",
+                "bare ~>[…] spelling must stay dim_arrow"
+            );
+        }
     }
 
     #[test]
