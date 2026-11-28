@@ -92,9 +92,32 @@ impl PrattEngine {
             } => {
                 if token.text.len() >= 2 * delim_chars {
                     let inner = &token.text[delim_chars..token.text.len() - delim_chars];
-                    let mut result = inner.to_string();
-                    for (from, to) in &escapes {
-                        result = result.replace(from, to);
+                    // Single left-to-right pass: at each position try each
+                    // `from` pattern anchored at the cursor (first declared
+                    // match wins). Sequential `str::replace` cannot express
+                    // escape semantics — with `\\`→`\` declared after `\n`→NL,
+                    // the `\n` rule fires *inside* `\\n` and `"\\n"` decodes to
+                    // `\`+newline instead of `\`+`n`.
+                    let mut result = String::with_capacity(inner.len());
+                    let mut i = 0;
+                    while i < inner.len() {
+                        let tail = &inner[i..];
+                        let mut matched = false;
+                        for (from, to) in &escapes {
+                            if !from.is_empty() && tail.starts_with(from.as_str()) {
+                                result.push_str(to);
+                                i += from.len();
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if !matched {
+                            // Copy one full char — `i` stays on a boundary
+                            // because `from` patterns are matched whole.
+                            let ch = tail.chars().next().unwrap_or('\0');
+                            result.push(ch);
+                            i += ch.len_utf8();
+                        }
                     }
                     Value::from(result)
                 } else {
@@ -4218,6 +4241,29 @@ mod tests {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect()
+    }
+
+    #[test]
+    fn string_literal_escaped_backslash_before_escape_letter() {
+        let engine = PrattEngine::new();
+        let lang = literal_lang();
+        // Token text `"a\\nb"` (a, backslash, backslash, n, b) must decode to
+        // `a` + `\` + `n` + `b` — the `\\` escape consumes both backslashes
+        // so the following `n` stays literal. Sequential `str::replace`
+        // applied `\n`→newline *inside* `\\n`, yielding `\`+newline.
+        let req = ParserRequest::new(Tokens(vec![tok("token.string", "\"a\\\\nb\"")]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.nodes()[0].payload, json!("a\\nb"));
+
+        // Same for `\\t`: `"a\\tb"` → `a\tb` (backslash + t), not `\`+TAB.
+        let req = ParserRequest::new(Tokens(vec![tok("token.string", "\"a\\\\tb\"")]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.nodes()[0].payload, json!("a\\tb"));
+
+        // And the plain escapes still decode: `"a\nb"` → `a`+NL+`b`.
+        let req = ParserRequest::new(Tokens(vec![tok("token.string", "\"a\\nb\"")]));
+        let ast = engine.parse(&lang, &req).unwrap();
+        assert_eq!(ast.nodes()[0].payload, json!("a\nb"));
     }
 
     #[test]
